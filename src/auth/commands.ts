@@ -1,14 +1,25 @@
 /**
- * `/login`, `/logout`, `/whoami` slash-command handlers.
+ * Handlers for `/sim login`, `/sim logout`, `/sim whoami`.
  *
- * `/login` runs the loopback OAuth flow:
- *   1. Start the callback server.
+ * These power the ATProto / Bluesky sign-in flow used by `--apply`
+ * subcommands that write records to the user's PDS. They are dispatched
+ * from inside the `/sim` slash command in `src/index.ts` rather than
+ * registered as top-level slash commands, because pi itself ships a
+ * built-in `/login` (Anthropic OAuth) and `/logout` — colliding with
+ * those would emit "Skipping in autocomplete" warnings on every boot
+ * and confuse users about which account they're signing into.
+ *
+ * `/sim login` runs the loopback OAuth flow described in
+ * https://atproto.com/guides/oauth-cli-tutorial:
+ *   1. Start a localhost server on 127.0.0.1:53682/callback.
  *   2. Build the authorize URL via `oauthClient.authorize(handle)`.
- *   3. Open the URL in the browser; also print it as a fallback.
+ *   3. Open the URL in the user's default browser; also print it as a
+ *      fallback in case the browser can't be opened (SSH, etc.).
  *   4. Wait for the `/callback` GET, exchange the code via
- *      `oauthClient.callback(searchParams)`.
- *   5. Persist the auth record (DID + handle) so subsequent commands
- *      can call `getAuthenticatedAgent()`.
+ *      `oauthClient.callback(searchParams)` (DPoP-bound).
+ *   5. Persist the auth record (DID + handle) to
+ *      ~/.config/pi-simocracy/auth.json so subsequent commands can
+ *      call `getAuthenticatedAgent()` from `src/writes.ts`.
  */
 
 import { exec } from "node:child_process";
@@ -31,7 +42,7 @@ export async function runLogin(
     handle = handleArg.replace(/^@/, "");
   } else {
     const prompt = await ctx.ui.input(
-      "ATProto handle to sign in with",
+      "Sign in with ATProto / Bluesky — your handle",
       "alice.bsky.social",
     );
     if (!prompt?.trim()) {
@@ -41,7 +52,10 @@ export async function runLogin(
     handle = prompt.trim().replace(/^@/, "");
   }
 
-  ctx.ui.notify("Starting loopback OAuth flow…", "info");
+  ctx.ui.notify(
+    `Signing in with ATProto / Bluesky as @${handle}. Starting loopback OAuth flow on 127.0.0.1:53682… (this is NOT Anthropic auth — pi's built-in /login does that.)`,
+    "info",
+  );
 
   let callback: Awaited<ReturnType<typeof startCallbackServer>>;
   try {
@@ -67,7 +81,7 @@ export async function runLogin(
     }
 
     ctx.ui.notify(
-      `Opening ${authUrl.origin} in your browser to authorize. If it doesn't open, paste this URL: ${authUrl.toString()}`,
+      `Opening ${authUrl.origin} in your browser — grant pi-simocracy access to your ATProto repo. If the browser doesn't open automatically, paste this URL: ${authUrl.toString()}`,
       "info",
     );
     openInBrowser(authUrl.toString());
@@ -92,8 +106,8 @@ export async function runLogin(
 
     ctx.ui.notify(
       handleResolved
-        ? `🔐 Signed in as @${handleResolved} (${did}).`
-        : `🔐 Signed in as ${did}.`,
+        ? `🔐 Signed in to ATProto as @${handleResolved} (${did}). You can now use /sim interview --apply and /sim train apply --apply to write to your PDS.`
+        : `🔐 Signed in to ATProto as ${did}. You can now use /sim interview --apply and /sim train apply --apply to write to your PDS.`,
       "info",
     );
   } finally {
@@ -104,12 +118,12 @@ export async function runLogin(
 export async function runLogout(ctx: ExtensionCommandContext): Promise<void> {
   const auth = readAuth();
   if (!auth) {
-    ctx.ui.notify("Not signed in.", "info");
+    ctx.ui.notify("Not signed into ATProto. (Note: this is separate from pi's Anthropic /login.)", "info");
     return;
   }
   clearAuth();
   ctx.ui.notify(
-    `Signed out ${auth.handle ? `@${auth.handle}` : auth.did}. Local OAuth tokens cleared.`,
+    `Signed out of ATProto ${auth.handle ? `@${auth.handle}` : auth.did}. Local OAuth tokens cleared from ~/.config/pi-simocracy/auth.json. (Pi's Anthropic session is unaffected.)`,
     "info",
   );
 }
@@ -117,13 +131,16 @@ export async function runLogout(ctx: ExtensionCommandContext): Promise<void> {
 export async function runWhoami(ctx: ExtensionCommandContext): Promise<void> {
   const auth = readAuth();
   if (!auth) {
-    ctx.ui.notify("Not signed in. Run /login.", "info");
+    ctx.ui.notify(
+      "Not signed into ATProto. Run `/sim login <handle>` (e.g. `/sim login alice.bsky.social`) to sign in with your Bluesky / ATProto account. This is separate from pi's built-in `/login` (Anthropic).",
+      "info",
+    );
     return;
   }
   ctx.ui.notify(
     auth.handle
-      ? `@${auth.handle} (${auth.did}) — signed in since ${auth.lastLogin}.`
-      : `${auth.did} — signed in since ${auth.lastLogin}.`,
+      ? `Signed into ATProto as @${auth.handle} (${auth.did}) since ${auth.lastLogin}. Use /sim interview --apply or /sim train apply --apply to write records to your PDS.`
+      : `Signed into ATProto as ${auth.did} since ${auth.lastLogin}. Use /sim interview --apply or /sim train apply --apply to write records to your PDS.`,
     "info",
   );
 }

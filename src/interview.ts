@@ -125,7 +125,7 @@ export async function runInterviewFlow(
       await applyDerivedToPds(ctx, loadedSim, template, reviewed, derived);
     } else {
       ctx.ui.notify(
-        "To save: copy the output into the constitution + style editors at simocracy.org, or sign in via /login and re-run with --apply.",
+        "To save: copy the output into the constitution + style editors at simocracy.org, or sign into ATProto via `/sim login <handle>` and re-run with --apply.",
         "info",
       );
     }
@@ -143,7 +143,7 @@ async function applyDerivedToPds(
 ): Promise<boolean> {
   const auth = readAuth();
   if (!auth) {
-    ctx.ui.notify("Not signed in. Run /login first.", "error");
+    ctx.ui.notify("Not signed into ATProto. Run `/sim login <handle>` first (e.g. `/sim login alice.bsky.social`).", "error");
     return false;
   }
   if (auth.did !== loadedSim.did) {
