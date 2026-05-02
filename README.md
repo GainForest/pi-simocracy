@@ -33,13 +33,17 @@ doesn't need it — it just rewrites pi's system prompt.
 
 ## Slash commands
 
-| Command          | What it does                                                |
-|------------------|-------------------------------------------------------------|
-| `/sim <name>`    | Load a sim by name (fuzzy search). Multiple matches → picker. |
-| `/sim <at-uri>`  | Load a sim by AT-URI directly (no search).                  |
-| `/sim status`    | Show which sim is currently loaded.                         |
-| `/sim unload`    | Drop the persona and break character cleanly.               |
-| `/sim help`      | Print usage.                                                |
+| Command           | What it does                                                |
+|-------------------|-------------------------------------------------------------|
+| `/sim <name>`     | Load a sim by name (fuzzy search). Multiple matches → picker. |
+| `/sim <at-uri>`   | Load a sim by AT-URI directly (no search).                  |
+| `/sim status`     | Show which sim is currently loaded.                         |
+| `/sim unload`     | Drop the persona and break character cleanly.               |
+| `/sim login [handle]` | Sign in to **ATProto / Bluesky** via loopback OAuth (NOT Anthropic — pi's built-in `/login` is what does that). Required before pi can update your sim. |
+| `/sim logout`     | Clear the local ATProto OAuth session.                      |
+| `/sim whoami`     | Show the signed-in handle / DID.                            |
+| `/sim my [name]`  | List / pick / fuzzy-load sims you own on your PDS. Single match auto-loads; ambiguous matches open a picker. Requires `/sim login`. |
+| `/sim help`       | Print usage.                                                |
 
 Examples:
 
@@ -47,8 +51,35 @@ Examples:
 /sim mr meow
 /sim Marie Curie
 /sim at://did:plc:qc42fmqqlsmdq7jiypiiigww/org.simocracy.sim/3mfo6vwfaka24
+/sim login alice.bsky.social
+/sim my
 /sim unload
 ```
+
+---
+
+## Editing a sim's constitution / speaking style
+
+There is no slash-command pipeline for this. Once you've signed in via
+`/sim login` and loaded a sim you own (`/sim my`, then pick), just
+**describe the change you want to pi**:
+
+```
+> add a red line about animal welfare to the constitution
+> rewrite the speaking style to drop the lenny faces and be more concise
+> shorten the constitution to ~300 words and emphasise renewable energy
+```
+
+Pi rewrites the constitution and/or speaking style itself, then calls
+the `simocracy_update_sim` tool to persist the result. The tool refuses
+to run if you're not signed in or you don't own the loaded sim. The
+new persona takes effect on the next reply — no reload needed.
+
+Writing goes directly to your PDS via
+`com.atproto.repo.createRecord` / `putRecord` against the
+`org.simocracy.agents` (constitution) and `org.simocracy.style`
+(speaking style) collections — the same lexicons simocracy.org reads
+back.
 
 ---
 
@@ -56,11 +87,12 @@ Examples:
 
 The same actions are exposed to pi as tools, so the model can drive them itself:
 
-| Tool                     | Use when                                                        |
-|--------------------------|-----------------------------------------------------------------|
-| `simocracy_load_sim`     | Load a sim into the current session (sets the persona).         |
-| `simocracy_unload_sim`   | Stop roleplaying.                                               |
-| `simocracy_chat`         | Send one message to a sim and get a quoted reply, **without** changing the active session persona. Useful for "ask Mr Meow what he thinks of this PR." Requires `OPENROUTER_API_KEY`. |
+| Tool                    | Use when                                                        |
+|-------------------------|-----------------------------------------------------------------|
+| `simocracy_load_sim`    | Load a sim into the current session (sets the persona).         |
+| `simocracy_unload_sim`  | Stop roleplaying.                                               |
+| `simocracy_chat`        | Send one message to a sim and get a quoted reply, **without** changing the active session persona. Useful for "ask Mr Meow what he thinks of this PR." Requires `OPENROUTER_API_KEY`. |
+| `simocracy_update_sim`  | Write a new constitution (`shortDescription` + `description`) and/or speaking `style` for the **loaded** sim to your PDS. Requires `/sim login` AND ownership of the loaded sim. |
 
 ---
 
@@ -98,9 +130,12 @@ keeps the terminal it's already running in.
 ```
 src/
 ├── index.ts        # extension entry: slash command, tools, persona injection
-├── simocracy.ts    # indexer + PDS client (read-only)
+├── persona.ts      # buildSimPrompt(sim) — the system-prompt fragment
+├── simocracy.ts    # indexer + PDS client (read-only fetchers)
+├── writes.ts       # PDS writers + ownership / sign-in preconditions
 ├── png-to-ansi.ts  # RGBA half-block ANSI renderer
-└── openrouter.ts   # minimal OpenRouter client (only used by simocracy_chat)
+├── openrouter.ts   # minimal OpenRouter client (only used by simocracy_chat)
+└── auth/           # ATProto OAuth loopback flow + session storage
 demo/
 └── sim-load.tape   # vhs tape — render with `vhs demo/sim-load.tape`
 ```

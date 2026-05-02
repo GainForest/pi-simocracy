@@ -10,7 +10,6 @@ const DEFAULT_INDEXER_URL = "https://simocracy-indexer-production.up.railway.app
 const COLLECTION_SIM = "org.simocracy.sim";
 const COLLECTION_AGENTS = "org.simocracy.agents";
 const COLLECTION_STYLE = "org.simocracy.style";
-const COLLECTION_INTERVIEW_TEMPLATE = "org.simocracy.interviewTemplate";
 
 export interface SpriteSettings {
   selectedOptions: Record<string, string>;
@@ -307,94 +306,9 @@ export async function fetchStyleForSim(simUri: string): Promise<StyleRecord | nu
   }
 }
 
-// ---------------------------------------------------------------------------
-// Interview templates (org.simocracy.interviewTemplate)
-// ---------------------------------------------------------------------------
-
-export interface InterviewQuestionRecord {
-  id: string;
-  type: "open" | "text" | "yesNo";
-  prompt: string;
-  required?: boolean;
-}
-
-export interface InterviewTemplateValue {
-  $type: "org.simocracy.interviewTemplate";
-  name: string;
-  description?: string;
-  questions: InterviewQuestionRecord[];
-  createdAt: string;
-}
-
-export interface LoadedInterviewTemplate {
-  uri: string;
-  cid: string;
-  did: string;
-  rkey: string;
-  template: InterviewTemplateValue;
-}
-
-/**
- * List interview templates from the Simocracy indexer. Mirrors
- * `fetchInterviewTemplates` in simocracy-v2's `lib/indexer.ts` (sans
- * the PDS fallback against the facilitator — pi-simocracy doesn't
- * know the facilitator DID, and an empty list is a soft failure
- * handled by the caller via the built-in fallback template).
- */
-export async function searchInterviewTemplates(
-  limit = 100,
-  opts: { indexerUrl?: string } = {},
-): Promise<LoadedInterviewTemplate[]> {
-  const indexerUrl = opts.indexerUrl ?? DEFAULT_INDEXER_URL;
-  const results: LoadedInterviewTemplate[] = [];
-  let cursor: string | null = null;
-  for (let page = 0; page < 10 && results.length < limit; page++) {
-    const { nodes, hasNextPage, endCursor } = await fetchRecords(
-      COLLECTION_INTERVIEW_TEMPLATE,
-      Math.min(100, limit - results.length),
-      cursor,
-      indexerUrl,
-    );
-    for (const node of nodes) {
-      const value = node.value as unknown as InterviewTemplateValue;
-      if (!value?.name || !Array.isArray(value.questions)) continue;
-      results.push({
-        uri: node.uri,
-        cid: node.cid,
-        did: node.did,
-        rkey: node.rkey,
-        template: value,
-      });
-    }
-    if (!hasNextPage || !endCursor) break;
-    cursor = endCursor;
-  }
-  return results;
-}
-
-/**
- * Fetch a single interview template directly from the owner's PDS by
- * AT-URI. Returns null on any failure — callers fall through to the
- * built-in template.
- */
-export async function fetchInterviewTemplateByUri(
-  templateUri: string,
-): Promise<LoadedInterviewTemplate | null> {
-  try {
-    const { did, collection, rkey } = parseAtUri(templateUri);
-    if (collection !== COLLECTION_INTERVIEW_TEMPLATE) return null;
-    const value = await getRecordFromPds<InterviewTemplateValue>(did, collection, rkey);
-    return {
-      uri: templateUri,
-      cid: "",
-      did,
-      rkey,
-      template: value,
-    };
-  } catch {
-    return null;
-  }
-}
+// (Interview-template fetchers were removed alongside the Training Lab /
+// Interview Modal pipelines. The only remaining persona-edit path is the
+// `simocracy_update_sim` LLM tool, which doesn't consume templates.)
 
 /** Resolve handle of a DID via Bluesky AppView (best-effort). */
 export async function resolveHandle(did: string): Promise<string | null> {

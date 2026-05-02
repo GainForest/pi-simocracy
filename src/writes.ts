@@ -1,10 +1,17 @@
 /**
  * PDS writes via the authenticated OAuth session.
  *
- * Three record types are written here:
- *   - org.simocracy.interview  (one per Apply, append-only)
- *   - org.simocracy.agents     (1:1 with sim — create or update)
- *   - org.simocracy.style      (1:1 with sim — create or update)
+ * Two record types are written here, both 1:1 with a sim and either
+ * created (first time) or put-overwritten (subsequent edits):
+ *   - org.simocracy.agents  — short description + constitution body
+ *   - org.simocracy.style   — speaking style description
+ *
+ * The questionnaire-driven `org.simocracy.interview` write path was
+ * removed when the structured Training Lab + Interview flows were
+ * dropped from this extension; constitution edits are now made
+ * directly via `simocracy_update_sim` (an LLM-callable tool the
+ * coding agent invokes after chatting with the user about how to
+ * refine the loaded sim).
  *
  * `getAuthenticatedAgent()` restores the session via the OAuth
  * client's session store and returns an `Agent` from `@atproto/api`,
@@ -15,13 +22,86 @@
 import { Agent } from "@atproto/api";
 
 import { getOAuthClient } from "./auth/oauth.ts";
-import { readAuth } from "./auth/storage.ts";
+import { readAuth, type AuthRecord } from "./auth/storage.ts";
+import { resolveHandle } from "./simocracy.ts";
 
 export class NotSignedInError extends Error {
   constructor(message = "Not signed into ATProto. Run `/sim login <handle>` first (e.g. `/sim login alice.bsky.social`). This is separate from pi's built-in `/login` (Anthropic).") {
     super(message);
     this.name = "NotSignedInError";
   }
+}
+
+/**
+ * Thrown when the signed-in DID does not own the sim that's about to
+ * be written to. The `simocracy.org` webapp owns the public lexicon
+ * surface, but per-sim records (`org.simocracy.agents`,
+ * `org.simocracy.style`) live in the *owner's* PDS — there's no
+ * shared repo. Without this guard a signed-in user could only ever
+ * write to their own repo anyway (the PDS rejects writes to other
+ * DIDs), but the failure would surface as a confusing XRPC 401 from
+ * the PDS at the moment of the call. This class lets the
+ * `simocracy_update_sim` tool fail fast with a human-readable
+ * message *before* it touches the network.
+ */
+export class NotSimOwnerError extends Error {
+  readonly ownerDid: string;
+  readonly ownerHandle: string | null;
+  readonly signedInDid: string;
+  readonly signedInHandle: string | null;
+  constructor(opts: {
+    ownerDid: string;
+    ownerHandle: string | null;
+    signedInDid: string;
+    signedInHandle: string | null;
+    action?: string;
+  }) {
+    const ownerLabel = opts.ownerHandle ? `@${opts.ownerHandle}` : opts.ownerDid;
+    const meLabel = opts.signedInHandle ? `@${opts.signedInHandle}` : opts.signedInDid;
+    const action = opts.action ?? "write to";
+    super(
+      `You can only ${action} sims you own. Loaded sim is owned by ${ownerLabel} — your signed-in DID is ${meLabel}.`,
+    );
+    this.name = "NotSimOwnerError";
+    this.ownerDid = opts.ownerDid;
+    this.ownerHandle = opts.ownerHandle;
+    this.signedInDid = opts.signedInDid;
+    this.signedInHandle = opts.signedInHandle;
+  }
+}
+
+/**
+ * Precondition for the write path: must be signed in *and* the
+ * signed-in DID must match the loaded sim's owner DID. Resolves the
+ * sim owner's handle on a best-effort basis so the error message is
+ * legible. Throws `NotSignedInError` or `NotSimOwnerError` — never
+ * returns falsy. Called by `simocracy_update_sim` (the tool entry
+ * point) before any XRPC traffic, and again at each call site in
+ * this module as defense-in-depth via `assertRepoOwnsSimUri`.
+ */
+export async function assertCanWriteToSim(loadedSim: {
+  did: string;
+  handle: string | null;
+}, opts: { action?: string } = {}): Promise<AuthRecord> {
+  const auth = readAuth();
+  if (!auth) {
+    const action = opts.action ?? "write to a sim";
+    throw new NotSignedInError(
+      `Not signed into ATProto — can't ${action}. Run \`/sim login <handle>\` first (e.g. \`/sim login alice.bsky.social\`). This is separate from pi's built-in \`/login\` (Anthropic).`,
+    );
+  }
+  if (auth.did !== loadedSim.did) {
+    const ownerHandle =
+      loadedSim.handle ?? (await resolveHandle(loadedSim.did).catch(() => null));
+    throw new NotSimOwnerError({
+      ownerDid: loadedSim.did,
+      ownerHandle,
+      signedInDid: auth.did,
+      signedInHandle: auth.handle,
+      action: opts.action,
+    });
+  }
+  return auth;
 }
 
 export async function getAuthenticatedAgent(): Promise<{ agent: Agent; did: string }> {
@@ -45,60 +125,40 @@ export async function getAuthenticatedAgent(): Promise<{ agent: Agent; did: stri
   return { agent, did: auth.did };
 }
 
-const COLLECTION_INTERVIEW = "org.simocracy.interview";
 const COLLECTION_AGENTS = "org.simocracy.agents";
 const COLLECTION_STYLE = "org.simocracy.style";
 
-interface OpenAnswer {
-  questionId?: string;
-  question: string;
-  answer: string;
-}
-interface YesNoAnswer {
-  questionId?: string;
-  statement: string;
-  answer: boolean;
-}
-
 /**
- * POST `org.simocracy.interview`. Mirrors `interview-modal.tsx`'s
- * save payload — with optional template StrongRef.
+ * Defense-in-depth: every write helper below verifies the target
+ * `repo` (which we always set to the signed-in DID) matches the
+ * sim's owner DID parsed out of the AT-URI. This prevents a future
+ * caller from accidentally passing the wrong `did` and writing
+ * orphaned per-sim records into the user's own repo that point at a
+ * sim they don't own. Throws `NotSimOwnerError` synchronously — the
+ * tool entry-point already checks up-front via
+ * `assertCanWriteToSim`, this is the belt-and-braces version that
+ * runs at the actual XRPC call site.
  */
-export async function createInterview(opts: {
-  agent: Agent;
-  did: string;
-  simUri: string;
-  simCid: string;
-  openAnswers: OpenAnswer[];
-  yesNoAnswers: YesNoAnswer[];
-  templateUri?: string;
-  templateCid?: string;
-}): Promise<{ uri: string; cid: string }> {
-  const record: Record<string, unknown> = {
-    $type: COLLECTION_INTERVIEW,
-    sim: { uri: opts.simUri, cid: opts.simCid },
-    openAnswers: opts.openAnswers.map((a) => ({
-      questionId: a.questionId,
-      question: a.question,
-      answer: a.answer,
-    })),
-    yesNoAnswers: opts.yesNoAnswers.map((a) => ({
-      questionId: a.questionId,
-      statement: a.statement,
-      answer: a.answer,
-    })),
-    createdAt: new Date().toISOString(),
-  };
-  if (opts.templateUri && opts.templateCid) {
-    record.template = { uri: opts.templateUri, cid: opts.templateCid };
+function assertRepoOwnsSimUri(did: string, simUri: string): void {
+  // simUri is at://<owner-did>/org.simocracy.sim/<rkey>; if the
+  // string didn't come from parseAtUri we still fall back to a string
+  // prefix check so this stays a pure precondition without re-fetching.
+  const owner = simUri.startsWith("at://")
+    ? simUri.slice("at://".length).split("/")[0]
+    : "";
+  if (!owner) {
+    throw new Error(
+      `Refusing to write: sim AT-URI "${simUri}" is not in at://<did>/<collection>/<rkey> form.`,
+    );
   }
-
-  const res = await opts.agent.com.atproto.repo.createRecord({
-    repo: opts.did,
-    collection: COLLECTION_INTERVIEW,
-    record,
-  });
-  return { uri: res.data.uri, cid: res.data.cid };
+  if (owner !== did) {
+    throw new NotSimOwnerError({
+      ownerDid: owner,
+      ownerHandle: null,
+      signedInDid: did,
+      signedInHandle: null,
+    });
+  }
 }
 
 /**
@@ -116,6 +176,7 @@ export async function createAgents(opts: {
   shortDescription: string;
   description: string;
 }): Promise<{ uri: string; cid: string; rkey: string }> {
+  assertRepoOwnsSimUri(opts.did, opts.simUri);
   const record = {
     $type: COLLECTION_AGENTS,
     sim: { uri: opts.simUri, cid: opts.simCid },
@@ -148,6 +209,7 @@ export async function updateAgents(opts: {
   shortDescription: string;
   description: string;
 }): Promise<{ uri: string; cid: string }> {
+  assertRepoOwnsSimUri(opts.did, opts.simUri);
   const record = {
     $type: COLLECTION_AGENTS,
     sim: { uri: opts.simUri, cid: opts.simCid },
@@ -171,6 +233,7 @@ export async function createStyle(opts: {
   simCid: string;
   description: string;
 }): Promise<{ uri: string; cid: string; rkey: string }> {
+  assertRepoOwnsSimUri(opts.did, opts.simUri);
   const record = {
     $type: COLLECTION_STYLE,
     sim: { uri: opts.simUri, cid: opts.simCid },
@@ -197,6 +260,7 @@ export async function updateStyle(opts: {
   simCid: string;
   description: string;
 }): Promise<{ uri: string; cid: string }> {
+  assertRepoOwnsSimUri(opts.did, opts.simUri);
   const record = {
     $type: COLLECTION_STYLE,
     sim: { uri: opts.simUri, cid: opts.simCid },

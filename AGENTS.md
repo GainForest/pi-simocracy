@@ -12,8 +12,12 @@ A `pi` extension. Single deliverable: an npm package called
 adds:
 
 1. The `/sim <name>` slash command (and `/sim status`, `/sim unload`).
-2. Three LLM-callable tools: `simocracy_load_sim`,
-   `simocracy_unload_sim`, `simocracy_chat`.
+2. Four LLM-callable tools: `simocracy_load_sim`,
+   `simocracy_unload_sim`, `simocracy_chat`, `simocracy_update_sim`.
+   The first three are read-only / session-local; `simocracy_update_sim`
+   is the **only** PDS write surface this extension exposes — it
+   writes a new constitution and/or speaking style for the loaded sim
+   to the user's repo, gated on `/sim login` + ownership.
 3. A `before_agent_start` event handler that injects the loaded sim's
    constitution and speaking style into pi's system prompt every turn.
 4. A custom message renderer (`simocracy_sim_loaded`) that prints the
@@ -35,10 +39,13 @@ here — push back to a separate extension.
 ├── tsconfig.json       # strict TS, bundler resolution, allowImportingTsExtensions
 ├── .npmrc              # legacy-peer-deps=true (peer deps are pi internals)
 ├── src/
-│   ├── index.ts        # extension entry — registers slash cmd + 3 tools + handlers
+│   ├── index.ts        # extension entry — registers slash cmd + 4 tools + handlers
+│   ├── persona.ts      # buildSimPrompt(sim) — the system-prompt fragment
 │   ├── simocracy.ts    # GraphQL indexer client + PDS client (read-only)
+│   ├── writes.ts       # PDS writers (agents + style) + auth / ownership preconditions
 │   ├── png-to-ansi.ts  # RGBA half-block ANSI renderer (pngjs-backed)
-│   └── openrouter.ts   # minimal OpenRouter client (only simocracy_chat uses it)
+│   ├── openrouter.ts   # minimal OpenRouter client (only simocracy_chat uses it)
+│   └── auth/           # ATProto loopback OAuth flow + session storage
 └── demo/
     └── sim-load.tape   # vhs tape that records the load → chat → unload flow
 ```

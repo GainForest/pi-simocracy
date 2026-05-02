@@ -8,22 +8,6 @@
 
 const DEFAULT_MODEL = "google/gemini-2.5-flash-lite";
 
-/**
- * Chat model for the Training Lab + interview flows. Mirrors
- * `DEFAULT_CHAT_MODEL` in `simocracy-v2/lib/openrouter.ts` — keep in
- * sync. Override via `DEFAULT_CHAT_MODEL` env var.
- */
-export const TRAINING_CHAT_MODEL =
-  process.env.DEFAULT_CHAT_MODEL ?? "google/gemini-3.1-flash-lite-preview";
-
-/**
- * Reasoning model used by the merge-constitution flow. Mirrors
- * `DEFAULT_REASONING_MODEL` in `simocracy-v2/lib/openrouter.ts` —
- * keep in sync. Override via `DEFAULT_REASONING_MODEL` env var.
- */
-export const TRAINING_REASONING_MODEL =
-  process.env.DEFAULT_REASONING_MODEL ?? "~google/gemini-pro-latest";
-
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;

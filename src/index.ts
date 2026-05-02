@@ -1,6 +1,7 @@
 /**
- * pi-simocracy — load a Simocracy sim into your pi chat, train its
- * constitution, and write it back to your ATProto PDS.
+ * pi-simocracy — load a Simocracy sim into your pi chat, refine its
+ * constitution + speaking style by chatting with pi, and write the
+ * result back to your ATProto PDS.
  *
  * Sim commands:
  *  - `/sim <name>`        Load a sim by name (fuzzy search on the indexer).
@@ -10,57 +11,43 @@
  *  - `/sim unload`        Drop the loaded sim and stop roleplaying.
  *  - `/sim status`        Show the currently loaded sim, if any.
  *
- * Constitution training (works on the loaded sim):
- *  - `/sim interview [name] [--apply]`
- *        Adaptive AI interview that derives a sim's constitution +
- *        speaking style from your answers. With `--apply` writes them
- *        back to your PDS (requires `/sim login`).
- *  - `/sim train baseline`
- *        Vote yes/no/abstain on sample proposals (5+ recommended).
- *  - `/sim train chat`
- *        Conversational training round — the sim asks targeted
- *        questions about gaps it sees in the baseline votes.
- *  - `/sim train profile`
- *        Distill the baseline + chat transcript into a structured
- *        TrainingProfile (priorities, red lines, tradeoffs).
- *  - `/sim train alignment`
- *        Score the sim against your hidden baseline and report match%.
- *  - `/sim train apply [--apply]`
- *        Merge the profile into the constitution. Without `--apply`
- *        copies the merged markdown to clipboard. With `--apply`
- *        writes to your PDS (requires `/sim login`).
- *  - `/sim train feedback`, `status`, `reset`
- *        Free-form feedback chat, status, and clear local state.
+ * Editing your sim's constitution / speaking style:
+ *  There is no `/sim train` or `/sim interview` slash flow. Instead,
+ *  load a sim you own and tell pi how you want the persona to change
+ *  ("add a red line about animal welfare", "make the speaking style
+ *  punchier and drop the lenny faces", etc.). Pi rewrites the
+ *  constitution and/or speaking style and calls the
+ *  `simocracy_update_sim` tool to write the result to your PDS.
+ *  Requires `/sim login` and ownership of the loaded sim.
  *
  * ATProto sign-in ("sign in with Bluesky / ATProto", NOT Anthropic):
  *  - `/sim login [handle]`
  *        Loopback OAuth flow — opens your PDS's authorize page in the
  *        browser, grants this CLI a DPoP-bound session, persists it to
- *        ~/.config/pi-simocracy/auth.json. Required before `--apply`
- *        writes records to your repo.
+ *        ~/.config/pi-simocracy/auth.json. Required before pi can
+ *        update your sim's constitution / style.
  *  - `/sim logout`        Clear the local OAuth session.
  *  - `/sim whoami`        Show the currently signed-in ATProto handle/DID.
  *
  * Browse your own sims (requires `/sim login`):
- *  - `/sim my`            List the org.simocracy.sim records owned by
- *                         the signed-in DID, newest first. Mirrors
- *                         simocracy.org's My Sims page in terminal form.
- *  - `/sim my <n>`        Load sim #n from that list (1-indexed).
+ *  - `/sim my`            Pick from the org.simocracy.sim records owned
+ *                         by the signed-in DID. Single sim auto-loads;
+ *                         multiple sims open a picker, and the chosen one
+ *                         renders inline exactly like `/sim <name>`.
  *  - `/sim my <name>`     Fuzzy-load by name within your own sims.
+ *                         Exact match auto-loads; ambiguous matches
+ *                         open the same picker.
  *
  * Tools (LLM-callable):
- *  - `simocracy_load_sim`           Same as /sim <name>.
- *  - `simocracy_unload_sim`         Same as /sim unload.
- *  - `simocracy_chat`               One-shot chat with a sim via
- *                                   OpenRouter (does not change the
- *                                   active session persona).
- *  - `simocracy_run_interview`      Run /sim interview programmatically.
- *  - `simocracy_derive_constitution`
- *                                   Given interview answers, return the
- *                                   derived constitution + style.
- *  - `simocracy_training_profile`   Distill baseline + transcript into
- *                                   a TrainingProfile.
- *  - `simocracy_alignment_test`     Score a profile against a baseline.
+ *  - `simocracy_load_sim`     Same as /sim <name>.
+ *  - `simocracy_unload_sim`   Same as /sim unload.
+ *  - `simocracy_chat`         One-shot chat with a sim via OpenRouter
+ *                             (does not change the active session
+ *                             persona).
+ *  - `simocracy_update_sim`   Write a new constitution and/or speaking
+ *                             style for the loaded sim to the user's
+ *                             PDS. Requires the user to be signed in
+ *                             via /sim login AND to own the sim.
  *
  * Note on /login: pi itself ships a built-in `/login` for Anthropic OAuth.
  * To avoid the collision (and to make it explicit you're signing into
@@ -97,28 +84,19 @@ import {
 } from "./png-to-ansi.ts";
 import { openRouterComplete, type ChatMessage } from "./openrouter.ts";
 import { buildSimPrompt, type LoadedSim } from "./persona.ts";
-import { runTrainCommand } from "./training/index.ts";
-import {
-  runInterviewFlow,
-  snapshotInterviewTemplate,
-  deriveFromInterview,
-} from "./interview.ts";
-import { deriveProfile, printProfile } from "./training/profile.ts";
-import {
-  loadTrainingLabState,
-  saveTrainingLabState,
-} from "./training/storage.ts";
-import { scoreAlignment, printAlignment } from "./training/alignment.ts";
-import type {
-  AlignmentResult,
-  BaselineProposal,
-  BaselineVote,
-  InterviewTurn,
-  TrainingProfile,
-  Vote,
-} from "./training/types.ts";
 import { runLogin, runLogout, runWhoami } from "./auth/commands.ts";
 import { readAuth } from "./auth/storage.ts";
+import {
+  assertCanWriteToSim,
+  createAgents,
+  createStyle,
+  findRkeyForSim,
+  getAuthenticatedAgent,
+  NotSignedInError,
+  NotSimOwnerError,
+  updateAgents,
+  updateStyle,
+} from "./writes.ts";
 
 // ---------------------------------------------------------------------------
 // State
@@ -303,94 +281,26 @@ const ChatToolParams = Type.Object({
 
 const UnloadToolParams = Type.Object({});
 
-const RunInterviewToolParams = Type.Object({
-  sim: Type.Optional(
+const UpdateSimToolParams = Type.Object({
+  shortDescription: Type.Optional(
     Type.String({
       description:
-        "Sim name or AT-URI to interview. Defaults to the currently loaded sim if omitted.",
+        "New short description for the sim's constitution. Max 300 chars; longer values will be truncated. Pass alongside `description` when rewriting the constitution; if you supply `description` without this, the existing short description (if any) is reused.",
+      maxLength: 300,
     }),
   ),
-  templateUri: Type.Optional(
+  description: Type.Optional(
     Type.String({
       description:
-        "AT-URI of an `org.simocracy.interviewTemplate` to use. Skips the picker.",
+        "New constitution body in markdown. Replaces the existing org.simocracy.agents record's `description`. Required when changing the constitution — a constitution with only a short description and no body is rejected.",
     }),
   ),
-});
-
-const OpenAnswerSchema = Type.Object({
-  question: Type.String(),
-  answer: Type.String(),
-});
-const YesNoAnswerSchema = Type.Object({
-  statement: Type.String(),
-  answer: Type.Boolean(),
-});
-
-const DeriveConstitutionToolParams = Type.Object({
-  openAnswers: Type.Optional(Type.Array(OpenAnswerSchema)),
-  yesNoAnswers: Type.Optional(Type.Array(YesNoAnswerSchema)),
-});
-
-const BaselineProposalSchema = Type.Object({
-  id: Type.String(),
-  title: Type.String(),
-  summary: Type.String(),
-  topic: Type.String(),
-});
-const BaselineVoteSchema = Type.Object({
-  proposalId: Type.String(),
-  vote: Type.Union([Type.Literal("yes"), Type.Literal("no"), Type.Literal("abstain")]),
-  importance: Type.Number(),
-  reasoning: Type.String(),
-});
-const InterviewTurnSchema = Type.Object({
-  role: Type.Union([Type.Literal("assistant"), Type.Literal("user")]),
-  content: Type.String(),
-  target: Type.Optional(Type.String()),
-});
-const IssuePrioritySchema = Type.Object({
-  issue: Type.String(),
-  stance: Type.String(),
-  importance: Type.Number(),
-  negotiability: Type.Number(),
-  confidence: Type.Number(),
-});
-const TrainingProfileSchema = Type.Object({
-  summary: Type.String(),
-  coreValues: Type.Array(Type.String()),
-  issuePriorities: Type.Array(IssuePrioritySchema),
-  redLines: Type.Array(Type.String()),
-  acceptableTradeoffs: Type.Array(Type.String()),
-  uncertaintyAreas: Type.Array(Type.String()),
-  representationRules: Type.Array(Type.String()),
-});
-
-const TrainingProfileToolParams = Type.Object({
-  simName: Type.String({ description: "The sim's display name." }),
-  existingConstitution: Type.Optional(Type.String()),
-  baselineVotes: Type.Array(BaselineVoteSchema),
-  baselineProposals: Type.Array(BaselineProposalSchema),
-  transcript: Type.Array(InterviewTurnSchema),
-});
-
-const AlignmentProposalSchema = Type.Object({
-  id: Type.String(),
-  title: Type.String(),
-  summary: Type.String(),
-  topic: Type.String(),
-  userVote: Type.Union([
-    Type.Literal("yes"),
-    Type.Literal("no"),
-    Type.Literal("abstain"),
-  ]),
-});
-
-const AlignmentTestToolParams = Type.Object({
-  simName: Type.String({ description: "The sim's display name." }),
-  existingConstitution: Type.Optional(Type.String()),
-  profile: TrainingProfileSchema,
-  proposals: Type.Array(AlignmentProposalSchema),
+  style: Type.Optional(
+    Type.String({
+      description:
+        "New speaking style description in markdown. Replaces the existing org.simocracy.style record's `description`. May be passed alone (style-only update) or together with `shortDescription` + `description` (constitution + style update).",
+    }),
+  ),
 });
 
 export default async function simocracy(pi: ExtensionAPI) {
@@ -443,7 +353,7 @@ export default async function simocracy(pi: ExtensionAPI) {
   // -------------------------------------------------------------------------
   pi.registerCommand("sim", {
     description:
-      "Simocracy: load/train sims, sign into ATProto. `/sim help` for the full list.",
+      "Simocracy: load sims, edit your own sim's constitution/style, sign into ATProto. `/sim help` for the full list.",
     handler: async (args, ctx) => {
       const arg = args.trim();
       if (!arg || arg === "help" || arg === "--help") {
@@ -453,24 +363,19 @@ export default async function simocracy(pi: ExtensionAPI) {
             "  /sim unload            stop roleplaying\n" +
             "  /sim status            show currently loaded sim\n" +
             "\n" +
-            "Constitution training (operates on the loaded sim):\n" +
-            "  /sim interview [name]  adaptive interview → derive constitution\n" +
-            "  /sim train baseline    vote on sample proposals\n" +
-            "  /sim train chat        conversational training round\n" +
-            "  /sim train profile     distill votes + chat → TrainingProfile\n" +
-            "  /sim train alignment   score sim against your baseline\n" +
-            "  /sim train apply       merge profile into constitution\n" +
-            "  /sim train status|reset|feedback\n" +
+            "Refining your sim's constitution / speaking style:\n" +
+            "  Just chat with pi about what you want to change — pi calls\n" +
+            "  the simocracy_update_sim tool to write the new constitution or\n" +
+            "  style to your PDS. Requires /sim login + sim ownership.\n" +
             "\n" +
             "Sign in with ATProto / Bluesky (not Anthropic — pi's built-in /login\n" +
-            "does that). Required before `--apply` writes to your PDS:\n" +
+            "does that). Required before pi can update your sim:\n" +
             "  /sim login [handle]    OAuth loopback flow (e.g. /sim login alice.bsky.social)\n" +
             "  /sim logout            clear local session\n" +
             "  /sim whoami            show signed-in handle/DID\n" +
             "\n" +
             "Browse your own sims (requires /sim login):\n" +
-            "  /sim my                list sims you own on your PDS\n" +
-            "  /sim my <n>            load sim #n from that list\n" +
+            "  /sim my                pick from sims you own (auto-loads if just one)\n" +
             "  /sim my <name>         fuzzy-load by name within your sims",
           "info",
         );
@@ -517,34 +422,6 @@ export default async function simocracy(pi: ExtensionAPI) {
           return;
         }
         await postSimToChat(pi, ctx, loadedSim, /*reload=*/ false);
-        return;
-      }
-      if (arg === "interview" || arg.startsWith("interview ") || arg.startsWith("interview\t")) {
-        const rest = arg.slice("interview".length).trim();
-        // Strip recognised flags (--apply) and use the rest as a sim name.
-        const tokens = rest.split(/\s+/).filter(Boolean);
-        const apply = tokens.includes("--apply");
-        const nameTokens = tokens.filter((t) => !t.startsWith("--"));
-        const simName = nameTokens.join(" ").trim();
-        if (simName && !loadedSim) {
-          const sim = await tryLoadFromQuery(simName);
-          if (!sim) {
-            ctx.ui.notify(`No sim found matching "${simName}".`, "error");
-            return;
-          }
-          loadedSim = sim;
-          await postSimToChat(pi, ctx, sim, /*reload=*/ true);
-        }
-        if (!loadedSim) {
-          ctx.ui.notify("No sim loaded. Use `/sim <name>` first or pass a name to `/sim interview <name>`.", "error");
-          return;
-        }
-        await runInterviewFlow(pi, ctx, loadedSim, { apply });
-        return;
-      }
-      if (arg === "train" || arg.startsWith("train ") || arg.startsWith("train\t")) {
-        const rest = arg.slice("train".length).trim();
-        await runTrainCommand(ctx, rest, loadedSim);
         return;
       }
       await runLoadFlow(pi, ctx, arg);
@@ -673,202 +550,175 @@ export default async function simocracy(pi: ExtensionAPI) {
   });
 
   // -------------------------------------------------------------------------
-  // Tool: simocracy_run_interview — run the interview questionnaire.
+  // Tool: simocracy_update_sim — write a new constitution and/or speaking
+  // style for the loaded sim to the signed-in user's PDS.
+  //
+  // This is the *only* persona-edit surface this extension exposes. The
+  // older Interview Modal + Training Lab pipelines (`/sim interview`,
+  // `/sim train …`) were removed in favour of this single tool: pi (the
+  // coding agent) chats with the user about how to refine the sim, then
+  // calls this tool with the new short description / constitution body /
+  // speaking style. The model itself does the rewriting; we just persist
+  // the result and update the in-memory persona so the next reply uses it.
   // -------------------------------------------------------------------------
   pi.registerTool({
-    name: "simocracy_run_interview",
-    label: "Run Simocracy interview",
+    name: "simocracy_update_sim",
+    label: "Update Simocracy sim constitution / style",
     description:
-      "Run the Simocracy interview questionnaire on the loaded sim and return the captured open + yes/no answers. With UI, drives the user through the questions interactively. Without UI, returns the structure of the chosen template as a planning aid (no answers).",
-    parameters: RunInterviewToolParams,
-    async execute(_id, { sim, templateUri }, _signal, _onUpdate, ctx) {
-      if (ctx.hasUI) {
-        let target: LoadedSim | null = loadedSim;
-        if (sim) {
-          const loaded = await tryLoadFromQuery(sim);
-          if (!loaded) throw new Error(`No sim found matching "${sim}".`);
-          loadedSim = loaded;
-          target = loaded;
-          await postSimToChat(pi, ctx, loaded, true);
-        }
-        if (!target) throw new Error("No sim loaded. Pass `sim` or call simocracy_load_sim first.");
-        const out = await runInterviewFlow(pi, ctx as ExtensionCommandContext, target, {
-          templateUri,
-        });
-        if (!out) {
-          return {
-            content: [{ type: "text" as const, text: "Interview cancelled." }],
-            details: { cancelled: true },
-          };
-        }
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Captured ${out.result.openAnswers.length} open answers and ${out.result.yesNoAnswers.length} value positions.`,
-            },
-          ],
-          details: out.result,
-        };
+      "Update the currently loaded Simocracy sim's constitution (short description + markdown body) and/or speaking style on the user's ATProto PDS. Use this when the user asks to refine, rewrite, extend, or fix any part of the loaded sim's persona — e.g. 'add a red line about animal welfare to the constitution', 'rewrite the speaking style to drop the lenny faces', 'shorten the constitution and emphasise renewable energy'. Pass `description` (with optional `shortDescription`) to update the constitution; pass `style` to update the speaking style; pass any combination. Requires the user to be signed in via /sim login AND to own the loaded sim — the call will fail otherwise. The new persona takes effect on the very next reply, no reload needed.",
+    parameters: UpdateSimToolParams,
+    async execute(_id, { shortDescription, description, style }) {
+      if (!loadedSim) {
+        throw new Error(
+          "No sim loaded. Call simocracy_load_sim first — the user must load the sim they want to edit.",
+        );
       }
-      // No UI: return the template snapshot as a planning aid.
-      const snapshot = await snapshotInterviewTemplate(templateUri);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text:
-              `Interview template "${snapshot.name}" — ${snapshot.questions.length} questions. ` +
-              `Run from a UI session to capture answers.`,
-          },
-        ],
-        details: { template: snapshot, openAnswers: [], yesNoAnswers: [] },
-      };
-    },
-  });
+      const wantsConstitution =
+        description !== undefined || shortDescription !== undefined;
+      const wantsStyle = style !== undefined;
+      if (!wantsConstitution && !wantsStyle) {
+        throw new Error(
+          "Pass at least one of `description`, `shortDescription`, `style`. Empty calls are rejected.",
+        );
+      }
+      // Owner + auth gate. The same precondition is re-checked at the
+      // XRPC call site in writes.ts (defense-in-depth) but we want a
+      // human-readable failure here before we touch the network.
+      let auth;
+      try {
+        auth = await assertCanWriteToSim(loadedSim, { action: "update" });
+      } catch (err) {
+        if (err instanceof NotSignedInError || err instanceof NotSimOwnerError) {
+          throw new Error(err.message);
+        }
+        throw err;
+      }
+      let pdsAgent;
+      try {
+        ({ agent: pdsAgent } = await getAuthenticatedAgent());
+      } catch (err) {
+        if (err instanceof NotSignedInError) throw new Error(err.message);
+        throw new Error(`ATProto auth failed: ${(err as Error).message}`);
+      }
 
-  // -------------------------------------------------------------------------
-  // Tool: simocracy_derive_constitution — turn answers into constitution+style.
-  // -------------------------------------------------------------------------
-  pi.registerTool({
-    name: "simocracy_derive_constitution",
-    label: "Derive Simocracy constitution",
-    description:
-      "Given an interview's open + yes/no answers, derive a sim constitution (short description + markdown body) and a speaking style. Returns plain markdown — no PDS write happens here.",
-    parameters: DeriveConstitutionToolParams,
-    async execute(_id, { openAnswers, yesNoAnswers }) {
-      const sim: LoadedSim = loadedSim ?? {
-        uri: "",
-        did: "",
-        rkey: "",
-        name: "Sim",
-        handle: null,
+      const updates: string[] = [];
+      const details: Record<string, unknown> = {
+        uri: loadedSim.uri,
+        did: loadedSim.did,
+        rkey: loadedSim.rkey,
+        name: loadedSim.name,
       };
-      const derived = await deriveFromInterview(sim, {
-        openAnswers: openAnswers ?? [],
-        yesNoAnswers: yesNoAnswers ?? [],
-      });
-      if (!derived) {
-        throw new Error("Could not parse derive-from-interview model output.");
+
+      // Constitution update — org.simocracy.agents. Lexicon stores both
+      // shortDescription (≤300 chars) and description (full markdown). If
+      // the caller only passed one of those, fall back to the existing
+      // value on the loaded sim so we never end up with a half-empty
+      // record.
+      if (wantsConstitution) {
+        const finalShort =
+          shortDescription !== undefined
+            ? shortDescription
+            : loadedSim.shortDescription ?? "";
+        const finalBody =
+          description !== undefined ? description : loadedSim.description ?? "";
+        if (!finalBody.trim()) {
+          throw new Error(
+            "Cannot write an empty constitution body. Pass `description` with the new markdown body.",
+          );
+        }
+        const existingRkey = await findRkeyForSim(
+          pdsAgent,
+          auth.did,
+          "org.simocracy.agents",
+          loadedSim.uri,
+        ).catch(() => null);
+        try {
+          if (existingRkey) {
+            const res = await updateAgents({
+              agent: pdsAgent,
+              did: auth.did,
+              rkey: existingRkey,
+              simUri: loadedSim.uri,
+              simCid: "",
+              shortDescription: finalShort,
+              description: finalBody,
+            });
+            details.agentsUri = res.uri;
+            updates.push(`Updated constitution (org.simocracy.agents/${existingRkey}).`);
+          } else {
+            const res = await createAgents({
+              agent: pdsAgent,
+              did: auth.did,
+              simUri: loadedSim.uri,
+              simCid: "",
+              shortDescription: finalShort,
+              description: finalBody,
+            });
+            details.agentsUri = res.uri;
+            updates.push(`Created constitution (org.simocracy.agents/${res.rkey}).`);
+          }
+        } catch (err) {
+          throw new Error(`Constitution write failed: ${(err as Error).message}`);
+        }
+        // Mutate in-memory persona so the next `before_agent_start` event
+        // injects the new constitution without requiring an unload/reload.
+        loadedSim.shortDescription = finalShort;
+        loadedSim.description = finalBody;
       }
-      const summary = [
-        `Short description:`,
-        derived.constitution.shortDescription,
+
+      // Speaking-style update — org.simocracy.style. Single field.
+      if (wantsStyle) {
+        const finalStyle = style ?? "";
+        if (!finalStyle.trim()) {
+          throw new Error(
+            "Cannot write an empty speaking style. Pass `style` with the new markdown body.",
+          );
+        }
+        const existingRkey = await findRkeyForSim(
+          pdsAgent,
+          auth.did,
+          "org.simocracy.style",
+          loadedSim.uri,
+        ).catch(() => null);
+        try {
+          if (existingRkey) {
+            const res = await updateStyle({
+              agent: pdsAgent,
+              did: auth.did,
+              rkey: existingRkey,
+              simUri: loadedSim.uri,
+              simCid: "",
+              description: finalStyle,
+            });
+            details.styleUri = res.uri;
+            updates.push(`Updated speaking style (org.simocracy.style/${existingRkey}).`);
+          } else {
+            const res = await createStyle({
+              agent: pdsAgent,
+              did: auth.did,
+              simUri: loadedSim.uri,
+              simCid: "",
+              description: finalStyle,
+            });
+            details.styleUri = res.uri;
+            updates.push(`Created speaking style (org.simocracy.style/${res.rkey}).`);
+          }
+        } catch (err) {
+          throw new Error(`Style write failed: ${(err as Error).message}`);
+        }
+        loadedSim.style = finalStyle;
+      }
+
+      const text = [
+        `Updated ${loadedSim.name} on ${auth.handle ? `@${auth.handle}` : auth.did}'s PDS:`,
+        ...updates.map((u) => `  - ${u}`),
         ``,
-        `Constitution:`,
-        derived.constitution.description,
-        ``,
-        `Speaking style:`,
-        derived.style.description,
+        `The new persona takes effect on your next reply.`,
       ].join("\n");
+      details.updates = updates;
       return {
-        content: [{ type: "text" as const, text: summary }],
-        details: derived,
-      };
-    },
-  });
-
-  // -------------------------------------------------------------------------
-  // Tool: simocracy_training_profile — distill into a TrainingProfile.
-  // -------------------------------------------------------------------------
-  pi.registerTool({
-    name: "simocracy_training_profile",
-    label: "Distill Simocracy training profile",
-    description:
-      "Distill a baseline questionnaire + interview transcript into a structured TrainingProfile (summary, core values, issue priorities, red lines, etc.). Read-only — does not write to the sim.",
-    parameters: TrainingProfileToolParams,
-    async execute(_id, params) {
-      const sim: LoadedSim = loadedSim ?? {
-        uri: "",
-        did: "",
-        rkey: "",
-        name: params.simName,
-        handle: null,
-        description: params.existingConstitution,
-      };
-      const stateSnapshot = {
-        baselineVotes: params.baselineVotes as BaselineVote[],
-        interviewTurns: params.transcript as InterviewTurn[],
-        feedbackTurns: [] as never[],
-        profile: null as TrainingProfile | null,
-        alignment: null as AlignmentResult | null,
-        updatedAt: new Date().toISOString(),
-      };
-      const profile = await deriveProfile(
-        { ...sim, description: params.existingConstitution ?? sim.description },
-        stateSnapshot,
-        params.baselineProposals as BaselineProposal[],
-      );
-      if (!profile) throw new Error("Could not parse training profile from model output.");
-      if (loadedSim && loadedSim.rkey) {
-        const persisted = loadTrainingLabState(loadedSim.rkey);
-        saveTrainingLabState(loadedSim.rkey, { ...persisted, profile, alignment: null });
-      }
-      try {
-        printProfile(profile);
-      } catch {
-        /* best effort */
-      }
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Distilled profile: ${profile.coreValues.length} core values, ${profile.issuePriorities.length} issue priorities, ${profile.redLines.length} red lines.`,
-          },
-        ],
-        details: profile,
-      };
-    },
-  });
-
-  // -------------------------------------------------------------------------
-  // Tool: simocracy_alignment_test — score the sim against baseline votes.
-  // -------------------------------------------------------------------------
-  pi.registerTool({
-    name: "simocracy_alignment_test",
-    label: "Run Simocracy alignment test",
-    description:
-      "Run the loaded sim's training profile against a list of proposals (each with the user's hidden vote) and return per-proposal match/mismatch + an overall match percentage. Calls the alignment prompt once per proposal at concurrency 4.",
-    parameters: AlignmentTestToolParams,
-    async execute(_id, params) {
-      const sim: LoadedSim = loadedSim ?? {
-        uri: "",
-        did: "",
-        rkey: "",
-        name: params.simName,
-        handle: null,
-        description: params.existingConstitution,
-      };
-      const aligned = (params.proposals as Array<BaselineProposal & { userVote: Vote }>).map(
-        (p) => ({
-          proposal: { id: p.id, title: p.title, summary: p.summary, topic: p.topic },
-          userVote: p.userVote,
-        }),
-      );
-      const alignment = await scoreAlignment(
-        { ...sim, description: params.existingConstitution ?? sim.description },
-        params.profile as TrainingProfile,
-        aligned,
-      );
-      if (loadedSim && loadedSim.rkey) {
-        const persisted = loadTrainingLabState(loadedSim.rkey);
-        saveTrainingLabState(loadedSim.rkey, { ...persisted, alignment });
-      }
-      try {
-        printAlignment(alignment, aligned);
-      } catch {
-        /* not in UI mode — printing is best-effort */
-      }
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Alignment: ${alignment.matchedCount}/${alignment.totalCount} matched. Weak areas: ${
-              alignment.weakAreas.length ? alignment.weakAreas.join(", ") : "none"
-            }.`,
-          },
-        ],
-        details: alignment,
+        content: [{ type: "text" as const, text }],
+        details,
       };
     },
   });
@@ -880,19 +730,16 @@ export default async function simocracy(pi: ExtensionAPI) {
 // ---------------------------------------------------------------------------
 
 /**
- * `/sim my [arg]` — list (and optionally load) sims owned by the
- * currently signed-in DID. Three calling conventions, picked by
- * cheapest-first:
+ * `/sim my [name]` — list and load sims owned by the currently
+ * signed-in DID. Mirrors the load UX of `/sim <name>` but pre-filtered
+ * to the user's own PDS:
  *
- *   - bare `/sim my`           →  print a numbered list, no load
- *   - `/sim my <n>` (digits)   →  load the n-th sim from the list
- *   - `/sim my <text>`         →  fuzzy-match by name within the user's
- *                                sims (uses the same scoring as the
- *                                global indexer search), load the best.
- *                                If two of the user's sims share a name
- *                                we prompt with a select. AT-URIs are
- *                                not allowed here — use `/sim <at-uri>`
- *                                directly for that.
+ *   - bare `/sim my`     →  if 1 sim: load it. If many: show a select
+ *                           picker; on pick, hydrate + render sprite
+ *                           inline exactly like `/sim <name>` does.
+ *   - `/sim my <name>`   →  fuzzy-match within the user's sims. Exact
+ *                           name match loads directly; otherwise the
+ *                           ranked candidates go into a select picker.
  *
  * Reads the user's sims from their PDS via `com.atproto.repo.listRecords`
  * (no DPoP needed for reads of the public collection), so this works
@@ -936,65 +783,52 @@ async function runMySimsCommand(
     return;
   }
 
-  // Bare `/sim my` — just list. Indented so the chat treats this as
-  // a content message (notify is best for short feedback; for the
-  // list we want fixed-width alignment so we go through the registered
-  // message renderer that the load flow already uses for sim summaries).
-  if (!arg) {
-    const lines: string[] = [];
-    lines.push(`📁 ${mySims.length} sim${mySims.length === 1 ? "" : "s"} owned by ${auth.handle ? `@${auth.handle}` : auth.did}:`);
-    lines.push("");
-    const maxNameLen = Math.min(
-      32,
-      mySims.reduce((m, s) => Math.max(m, s.sim.name.length), 0),
-    );
-    mySims.forEach((s, i) => {
-      const idx = String(i + 1).padStart(2, " ");
-      const name = s.sim.name.length > maxNameLen ? s.sim.name.slice(0, maxNameLen - 1) + "…" : s.sim.name.padEnd(maxNameLen, " ");
-      const created = (s.sim.createdAt || "").slice(0, 10);
-      lines.push(`  ${idx}. ${name}  ${created}  at://…/${s.rkey}`);
-    });
-    lines.push("");
-    lines.push("Load one with `/sim my <n>` (e.g. `/sim my 1`) or `/sim my <name>`.");
-    ctx.ui.notify(lines.join("\n"), "info");
-    return;
-  }
-
-  // `/sim my <n>` — numeric index into the list above.
-  if (/^\d+$/.test(arg)) {
-    const n = parseInt(arg, 10);
-    if (n < 1 || n > mySims.length) {
+  // Narrow the candidate pool to fuzzy-matched sims when an arg was
+  // supplied; otherwise the full owned list is the candidate pool.
+  let candidates: SimMatch[];
+  if (arg) {
+    const matches = fuzzyMatchOwnedSims(mySims, arg);
+    if (matches.length === 0) {
       ctx.ui.notify(
-        `No sim #${n} — you have ${mySims.length}. Run /sim my (no args) to see the list.`,
+        `No sim matching "${arg}" in your ${mySims.length} sim${mySims.length === 1 ? "" : "s"}. Run /sim my (no args) to see them.`,
         "error",
       );
       return;
     }
-    await loadAndPostMySim(pi, ctx, mySims[n - 1]);
-    return;
-  }
-
-  // `/sim my <name>` — fuzzy-match within the user's own sims.
-  const matches = fuzzyMatchOwnedSims(mySims, arg);
-  if (matches.length === 0) {
-    ctx.ui.notify(
-      `No sim matching "${arg}" in your ${mySims.length} sim${mySims.length === 1 ? "" : "s"}. Run /sim my (no args) to see them.`,
-      "error",
-    );
-    return;
-  }
-  let chosen = matches[0];
-  if (matches.length > 1 && matches[0].score > 0) {
-    // Multiple non-exact matches — ask. Skip the prompt for an exact match.
-    const labels = matches.map((m) => `${m.sim.sim.name}  —  at://…/${m.sim.rkey}`);
-    const picked = await ctx.ui.select(`Multiple matches for "${arg}" in your sims`, labels);
-    if (!picked) {
-      ctx.ui.notify("Cancelled.", "info");
+    // Exact name match — load straight away, same shortcut /sim <name>
+    // takes when the indexer returns one perfect hit.
+    if (matches.length === 1 || matches[0].score === 0) {
+      await loadAndPostMySim(pi, ctx, matches[0].sim);
       return;
     }
-    chosen = matches[labels.indexOf(picked)];
+    candidates = matches.map((m) => m.sim);
+  } else {
+    if (mySims.length === 1) {
+      // Only one owned sim — skip the picker, just load it.
+      await loadAndPostMySim(pi, ctx, mySims[0]);
+      return;
+    }
+    candidates = mySims;
   }
-  await loadAndPostMySim(pi, ctx, chosen.sim);
+
+  // Picker — same shape as /sim <name>'s ambiguous-match prompt so the
+  // two flows feel identical. We show created-date as a secondary key
+  // since multiple sims can share a name within one repo.
+  const labels = candidates.map((s) => {
+    const created = (s.sim.createdAt || "").slice(0, 10);
+    const tail = created ? `${created}  at://…/${s.rkey}` : `at://…/${s.rkey}`;
+    return `${s.sim.name}  —  ${tail}`;
+  });
+  const title = arg
+    ? `Matches for "${arg}" in your ${mySims.length} sim${mySims.length === 1 ? "" : "s"}`
+    : `Your sims (${mySims.length})`;
+  const picked = await ctx.ui.select(title, labels);
+  if (!picked) {
+    ctx.ui.notify("Cancelled.", "info");
+    return;
+  }
+  const chosen = candidates[labels.indexOf(picked)];
+  await loadAndPostMySim(pi, ctx, chosen);
 }
 
 async function loadAndPostMySim(

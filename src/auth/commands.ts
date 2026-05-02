@@ -106,8 +106,8 @@ export async function runLogin(
 
     ctx.ui.notify(
       handleResolved
-        ? `🔐 Signed in to ATProto as @${handleResolved} (${did}). You can now use /sim interview --apply and /sim train apply --apply to write to your PDS.`
-        : `🔐 Signed in to ATProto as ${did}. You can now use /sim interview --apply and /sim train apply --apply to write to your PDS.`,
+        ? `🔐 Signed in to ATProto as @${handleResolved} (${did}). Pi can now update the constitution / speaking style of any sim you own via the simocracy_update_sim tool — just load one of your sims with /sim my and ask pi for the change you want.`
+        : `🔐 Signed in to ATProto as ${did}. Pi can now update the constitution / speaking style of any sim you own via the simocracy_update_sim tool — just load one of your sims with /sim my and ask pi for the change you want.`,
       "info",
     );
   } finally {
@@ -139,8 +139,8 @@ export async function runWhoami(ctx: ExtensionCommandContext): Promise<void> {
   }
   ctx.ui.notify(
     auth.handle
-      ? `Signed into ATProto as @${auth.handle} (${auth.did}) since ${auth.lastLogin}. Use /sim interview --apply or /sim train apply --apply to write records to your PDS.`
-      : `Signed into ATProto as ${auth.did} since ${auth.lastLogin}. Use /sim interview --apply or /sim train apply --apply to write records to your PDS.`,
+      ? `Signed into ATProto as @${auth.handle} (${auth.did}) since ${auth.lastLogin}. Pi can update the constitution / speaking style of any sim you own (loaded via /sim my) by calling the simocracy_update_sim tool.`
+      : `Signed into ATProto as ${auth.did} since ${auth.lastLogin}. Pi can update the constitution / speaking style of any sim you own (loaded via /sim my) by calling the simocracy_update_sim tool.`,
     "info",
   );
 }
