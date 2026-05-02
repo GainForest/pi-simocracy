@@ -25,8 +25,20 @@ import {
 import {
   searchInterviewTemplates,
   fetchInterviewTemplateByUri,
+  resolveHandle,
   type LoadedInterviewTemplate,
 } from "./simocracy.ts";
+import { readAuth } from "./auth/storage.ts";
+import {
+  createAgents,
+  createInterview,
+  createStyle,
+  findRkeyForSim,
+  getAuthenticatedAgent,
+  NotSignedInError,
+  updateAgents,
+  updateStyle,
+} from "./writes.ts";
 
 interface OpenAnswer {
   question: string;
@@ -51,6 +63,8 @@ export interface RunInterviewOptions {
   templateUri?: string;
   /** When true, skip the picker and just use the first matching template. */
   pickFirst?: boolean;
+  /** When true, after deriving, write to the user's PDS via OAuth. */
+  apply?: boolean;
 }
 
 /**
@@ -107,13 +121,157 @@ export async function runInterviewFlow(
 
   if (derived) {
     printDerived(loadedSim, derived);
-    ctx.ui.notify(
-      "To save: copy the output into the constitution + style editors at simocracy.org. PR 3 (coming soon) will add `--apply` to write directly to your PDS.",
-      "info",
-    );
+    if (opts.apply) {
+      await applyDerivedToPds(ctx, loadedSim, template, reviewed, derived);
+    } else {
+      ctx.ui.notify(
+        "To save: copy the output into the constitution + style editors at simocracy.org, or sign in via /login and re-run with --apply.",
+        "info",
+      );
+    }
   }
 
   return { result: reviewed, derived };
+}
+
+async function applyDerivedToPds(
+  ctx: ExtensionCommandContext,
+  loadedSim: LoadedSim,
+  template: LoadedInterviewTemplate,
+  result: InterviewResult,
+  derived: DerivedSim,
+): Promise<boolean> {
+  const auth = readAuth();
+  if (!auth) {
+    ctx.ui.notify("Not signed in. Run /login first.", "error");
+    return false;
+  }
+  if (auth.did !== loadedSim.did) {
+    const ownerHandle =
+      loadedSim.handle ?? (await resolveHandle(loadedSim.did).catch(() => null));
+    ctx.ui.notify(
+      `You can only apply to sims you own. Loaded sim is owned by ${
+        ownerHandle ? `@${ownerHandle}` : loadedSim.did
+      } — your signed-in DID is ${auth.did}.`,
+      "error",
+    );
+    return false;
+  }
+
+  let agent;
+  try {
+    ({ agent } = await getAuthenticatedAgent());
+  } catch (err) {
+    if (err instanceof NotSignedInError) ctx.ui.notify(err.message, "error");
+    else ctx.ui.notify(`Auth failed: ${(err as Error).message}`, "error");
+    return false;
+  }
+
+  ctx.ui.notify("Writing interview record…", "info");
+  try {
+    await createInterview({
+      agent,
+      did: auth.did,
+      simUri: loadedSim.uri,
+      simCid: "",
+      openAnswers: result.openAnswers.map((a) => ({
+        question: a.question,
+        answer: a.answer,
+      })),
+      yesNoAnswers: result.yesNoAnswers.map((a) => ({
+        statement: a.statement,
+        answer: a.answer,
+      })),
+      templateUri: template.uri || undefined,
+      templateCid: template.cid || undefined,
+    });
+  } catch (err) {
+    ctx.ui.notify(`Interview write failed: ${(err as Error).message}`, "error");
+    return false;
+  }
+
+  // Now create-or-update the agents + style records to match the
+  // derived constitution. Mirrors `derive-from-interview/route.ts`'s
+  // flow on simocracy-v2.
+  const existingAgents = await findRkeyForSim(
+    agent,
+    auth.did,
+    "org.simocracy.agents",
+    loadedSim.uri,
+  ).catch(() => null);
+  ctx.ui.notify(
+    existingAgents
+      ? `Updating org.simocracy.agents (${existingAgents})…`
+      : "Creating org.simocracy.agents…",
+    "info",
+  );
+  try {
+    if (existingAgents) {
+      await updateAgents({
+        agent,
+        did: auth.did,
+        rkey: existingAgents,
+        simUri: loadedSim.uri,
+        simCid: "",
+        shortDescription: derived.constitution.shortDescription,
+        description: derived.constitution.description,
+      });
+    } else {
+      await createAgents({
+        agent,
+        did: auth.did,
+        simUri: loadedSim.uri,
+        simCid: "",
+        shortDescription: derived.constitution.shortDescription,
+        description: derived.constitution.description,
+      });
+    }
+  } catch (err) {
+    ctx.ui.notify(`Agents write failed: ${(err as Error).message}`, "error");
+    return false;
+  }
+
+  const existingStyle = await findRkeyForSim(
+    agent,
+    auth.did,
+    "org.simocracy.style",
+    loadedSim.uri,
+  ).catch(() => null);
+  ctx.ui.notify(
+    existingStyle ? `Updating org.simocracy.style (${existingStyle})…` : "Creating org.simocracy.style…",
+    "info",
+  );
+  try {
+    if (existingStyle) {
+      await updateStyle({
+        agent,
+        did: auth.did,
+        rkey: existingStyle,
+        simUri: loadedSim.uri,
+        simCid: "",
+        description: derived.style.description,
+      });
+    } else {
+      await createStyle({
+        agent,
+        did: auth.did,
+        simUri: loadedSim.uri,
+        simCid: "",
+        description: derived.style.description,
+      });
+    }
+  } catch (err) {
+    ctx.ui.notify(`Style write failed: ${(err as Error).message}`, "error");
+    return false;
+  }
+
+  ctx.ui.notify(
+    `Saved interview, constitution, and speaking style to ${
+      auth.handle ? `@${auth.handle}` : auth.did
+    }'s PDS.`,
+    "info",
+  );
+  return true;
 }
 
 /**

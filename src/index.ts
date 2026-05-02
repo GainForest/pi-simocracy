@@ -64,6 +64,7 @@ import type {
   TrainingProfile,
   Vote,
 } from "./training/types.ts";
+import { runLogin, runLogout, runWhoami } from "./auth/commands.ts";
 
 // ---------------------------------------------------------------------------
 // State
@@ -419,11 +420,15 @@ export default async function simocracy(pi: ExtensionAPI) {
       }
       if (arg === "interview" || arg.startsWith("interview ") || arg.startsWith("interview\t")) {
         const rest = arg.slice("interview".length).trim();
-        if (rest && !loadedSim) {
-          // Load the named sim first.
-          const sim = await tryLoadFromQuery(rest);
+        // Strip recognised flags (--apply) and use the rest as a sim name.
+        const tokens = rest.split(/\s+/).filter(Boolean);
+        const apply = tokens.includes("--apply");
+        const nameTokens = tokens.filter((t) => !t.startsWith("--"));
+        const simName = nameTokens.join(" ").trim();
+        if (simName && !loadedSim) {
+          const sim = await tryLoadFromQuery(simName);
           if (!sim) {
-            ctx.ui.notify(`No sim found matching "${rest}".`, "error");
+            ctx.ui.notify(`No sim found matching "${simName}".`, "error");
             return;
           }
           loadedSim = sim;
@@ -433,7 +438,7 @@ export default async function simocracy(pi: ExtensionAPI) {
           ctx.ui.notify("No sim loaded. Use `/sim <name>` first or pass a name to `/sim interview <name>`.", "error");
           return;
         }
-        await runInterviewFlow(pi, ctx, loadedSim);
+        await runInterviewFlow(pi, ctx, loadedSim, { apply });
         return;
       }
       if (arg === "train" || arg.startsWith("train ") || arg.startsWith("train\t")) {
@@ -442,6 +447,28 @@ export default async function simocracy(pi: ExtensionAPI) {
         return;
       }
       await runLoadFlow(pi, ctx, arg);
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Slash commands: /login, /logout, /whoami (ATProto OAuth)
+  // -------------------------------------------------------------------------
+  pi.registerCommand("login", {
+    description: "Sign in to your ATProto account via the loopback OAuth flow.",
+    handler: async (args, ctx) => {
+      await runLogin(ctx, args);
+    },
+  });
+  pi.registerCommand("logout", {
+    description: "Sign out and clear local OAuth tokens.",
+    handler: async (_args, ctx) => {
+      await runLogout(ctx);
+    },
+  });
+  pi.registerCommand("whoami", {
+    description: "Show the currently signed-in ATProto identity.",
+    handler: async (_args, ctx) => {
+      await runWhoami(ctx);
     },
   });
 

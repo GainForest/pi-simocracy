@@ -15,6 +15,15 @@ import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 
 import type { LoadedSim } from "../persona.ts";
 import { openRouterComplete, TRAINING_REASONING_MODEL } from "../openrouter.ts";
+import { readAuth } from "../auth/storage.ts";
+import { resolveHandle } from "../simocracy.ts";
+import {
+  createAgents,
+  findRkeyForSim,
+  getAuthenticatedAgent,
+  NotSignedInError,
+  updateAgents,
+} from "../writes.ts";
 import {
   loadTrainingLabState,
   saveTrainingLabState,
@@ -31,6 +40,7 @@ export interface MergeOutput {
 export async function runApply(
   ctx: ExtensionCommandContext,
   loadedSim: LoadedSim,
+  opts: { apply?: boolean } = {},
 ): Promise<MergeOutput | null> {
   const state = loadTrainingLabState(loadedSim.rkey);
   if (!state.profile) {
@@ -47,9 +57,8 @@ export async function runApply(
     return null;
   }
 
-  // No state mutation here — the canonical record lives on the user's
-  // PDS, and PR 3 wires up the actual write. We re-save state so the
-  // updatedAt bumps for /sim train status.
+  // Re-save state so the updatedAt bumps for /sim train status; the
+  // canonical record still lives on the user's PDS.
   saveTrainingLabState(loadedSim.rkey, state);
 
   console.log("");
@@ -60,20 +69,111 @@ export async function runApply(
   console.log(merged.description);
   console.log("");
 
+  if (opts.apply) {
+    const written = await writeAgentsToPds(ctx, loadedSim, merged);
+    if (written) return merged;
+    return null;
+  }
+
   const clipboardPayload = formatClipboard(merged);
   const copied = await copyToClipboard(clipboardPayload);
   if (copied) {
     ctx.ui.notify(
-      `Copied to clipboard. Paste into the constitution editor at https://simocracy.org/sims/${loadedSim.did}/${loadedSim.rkey}.`,
+      `Copied to clipboard. Paste into the constitution editor at https://simocracy.org/sims/${loadedSim.did}/${loadedSim.rkey}, or re-run with --apply once you've signed in via /login.`,
       "info",
     );
   } else {
     ctx.ui.notify(
-      "Could not copy to clipboard — copy the printed output manually.",
+      "Could not copy to clipboard — copy the printed output manually, or sign in via /login and re-run with --apply.",
       "warning",
     );
   }
   return merged;
+}
+
+/**
+ * Write the merged constitution to the user's PDS via OAuth. Enforces
+ * the owner check (loaded sim's DID must match the signed-in DID).
+ * Returns true on success.
+ */
+async function writeAgentsToPds(
+  ctx: ExtensionCommandContext,
+  loadedSim: LoadedSim,
+  merged: MergeOutput,
+): Promise<boolean> {
+  const auth = readAuth();
+  if (!auth) {
+    ctx.ui.notify("Not signed in. Run /login first.", "error");
+    return false;
+  }
+  if (auth.did !== loadedSim.did) {
+    const ownerHandle =
+      loadedSim.handle ?? (await resolveHandle(loadedSim.did).catch(() => null));
+    ctx.ui.notify(
+      `You can only apply to sims you own. Loaded sim is owned by ${
+        ownerHandle ? `@${ownerHandle}` : loadedSim.did
+      } — your signed-in DID is ${auth.did}.`,
+      "error",
+    );
+    return false;
+  }
+
+  let agent;
+  try {
+    ({ agent } = await getAuthenticatedAgent());
+  } catch (err) {
+    if (err instanceof NotSignedInError) {
+      ctx.ui.notify(err.message, "error");
+    } else {
+      ctx.ui.notify(`Auth failed: ${(err as Error).message}`, "error");
+    }
+    return false;
+  }
+
+  const existingRkey = await findRkeyForSim(
+    agent,
+    auth.did,
+    "org.simocracy.agents",
+    loadedSim.uri,
+  ).catch(() => null);
+
+  ctx.ui.notify(
+    existingRkey
+      ? `Updating org.simocracy.agents (${existingRkey})…`
+      : "Creating org.simocracy.agents…",
+    "info",
+  );
+  try {
+    if (existingRkey) {
+      await updateAgents({
+        agent,
+        did: auth.did,
+        rkey: existingRkey,
+        simUri: loadedSim.uri,
+        simCid: "", // CID required by lexicon validators is permissive — empty is acceptable for a fresh write here.
+        shortDescription: merged.shortDescription,
+        description: merged.description,
+      });
+    } else {
+      await createAgents({
+        agent,
+        did: auth.did,
+        simUri: loadedSim.uri,
+        simCid: "",
+        shortDescription: merged.shortDescription,
+        description: merged.description,
+      });
+    }
+  } catch (err) {
+    ctx.ui.notify(`PDS write failed: ${(err as Error).message}`, "error");
+    return false;
+  }
+
+  ctx.ui.notify(
+    `Wrote constitution to ${auth.handle ? `@${auth.handle}` : auth.did}'s PDS. Refresh https://simocracy.org/sims/${loadedSim.did}/${loadedSim.rkey} to see it.`,
+    "info",
+  );
+  return true;
 }
 
 export async function mergeConstitution(
