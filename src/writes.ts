@@ -18,7 +18,7 @@ import { getOAuthClient } from "./auth/oauth.ts";
 import { readAuth } from "./auth/storage.ts";
 
 export class NotSignedInError extends Error {
-  constructor(message = "Not signed in. Run /login first.") {
+  constructor(message = "Not signed into ATProto. Run `/sim login <handle>` first (e.g. `/sim login alice.bsky.social`). This is separate from pi's built-in `/login` (Anthropic).") {
     super(message);
     this.name = "NotSignedInError";
   }
@@ -38,7 +38,7 @@ export async function getAuthenticatedAgent(): Promise<{ agent: Agent; did: stri
     oauthSession = await client.restore(auth.did);
   } catch (err) {
     throw new NotSignedInError(
-      `Stored session for ${auth.did} could not be restored — please /login again. (${(err as Error).message})`,
+      `Stored ATProto session for ${auth.did} could not be restored — please run /sim login again. (${(err as Error).message})`,
     );
   }
   const agent = new Agent(oauthSession);

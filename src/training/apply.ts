@@ -79,12 +79,12 @@ export async function runApply(
   const copied = await copyToClipboard(clipboardPayload);
   if (copied) {
     ctx.ui.notify(
-      `Copied to clipboard. Paste into the constitution editor at https://simocracy.org/sims/${loadedSim.did}/${loadedSim.rkey}, or re-run with --apply once you've signed in via /login.`,
+      `Copied to clipboard. Paste into the constitution editor at https://simocracy.org/sims/${loadedSim.did}/${loadedSim.rkey}, or re-run with --apply once you've signed in via /sim login.`,
       "info",
     );
   } else {
     ctx.ui.notify(
-      "Could not copy to clipboard — copy the printed output manually, or sign in via /login and re-run with --apply.",
+      "Could not copy to clipboard — copy the printed output manually, or sign in via /sim login and re-run with --apply.",
       "warning",
     );
   }
@@ -103,7 +103,7 @@ async function writeAgentsToPds(
 ): Promise<boolean> {
   const auth = readAuth();
   if (!auth) {
-    ctx.ui.notify("Not signed in. Run /login first.", "error");
+    ctx.ui.notify("Not signed into ATProto. Run `/sim login <handle>` first (e.g. `/sim login alice.bsky.social`).", "error");
     return false;
   }
   if (auth.did !== loadedSim.did) {

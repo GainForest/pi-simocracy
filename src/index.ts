@@ -1,19 +1,64 @@
 /**
- * pi-simocracy — load a Simocracy sim into your pi chat.
+ * pi-simocracy — load a Simocracy sim into your pi chat, train its
+ * constitution, and write it back to your ATProto PDS.
  *
- *  - `/sim <name>`   Load a sim by name (fuzzy search on the indexer).
- *                    Renders the sim's sprite as colored ANSI art directly
- *                    in the chat and pushes its constitution + speaking
- *                    style into the system prompt so pi roleplays as the
- *                    sim.
- *  - `/sim unload`   Drop the loaded sim and stop roleplaying.
- *  - `/sim status`   Show the currently loaded sim, if any.
+ * Sim commands:
+ *  - `/sim <name>`        Load a sim by name (fuzzy search on the indexer).
+ *                         Renders the sprite inline as colored ANSI art and
+ *                         pushes the sim's constitution + style into the
+ *                         system prompt so pi roleplays as the sim.
+ *  - `/sim unload`        Drop the loaded sim and stop roleplaying.
+ *  - `/sim status`        Show the currently loaded sim, if any.
+ *
+ * Constitution training (works on the loaded sim):
+ *  - `/sim interview [name] [--apply]`
+ *        Adaptive AI interview that derives a sim's constitution +
+ *        speaking style from your answers. With `--apply` writes them
+ *        back to your PDS (requires `/sim login`).
+ *  - `/sim train baseline`
+ *        Vote yes/no/abstain on sample proposals (5+ recommended).
+ *  - `/sim train chat`
+ *        Conversational training round — the sim asks targeted
+ *        questions about gaps it sees in the baseline votes.
+ *  - `/sim train profile`
+ *        Distill the baseline + chat transcript into a structured
+ *        TrainingProfile (priorities, red lines, tradeoffs).
+ *  - `/sim train alignment`
+ *        Score the sim against your hidden baseline and report match%.
+ *  - `/sim train apply [--apply]`
+ *        Merge the profile into the constitution. Without `--apply`
+ *        copies the merged markdown to clipboard. With `--apply`
+ *        writes to your PDS (requires `/sim login`).
+ *  - `/sim train feedback`, `status`, `reset`
+ *        Free-form feedback chat, status, and clear local state.
+ *
+ * ATProto sign-in ("sign in with Bluesky / ATProto", NOT Anthropic):
+ *  - `/sim login [handle]`
+ *        Loopback OAuth flow — opens your PDS's authorize page in the
+ *        browser, grants this CLI a DPoP-bound session, persists it to
+ *        ~/.config/pi-simocracy/auth.json. Required before `--apply`
+ *        writes records to your repo.
+ *  - `/sim logout`        Clear the local OAuth session.
+ *  - `/sim whoami`        Show the currently signed-in ATProto handle/DID.
  *
  * Tools (LLM-callable):
- *  - `simocracy_load_sim`    Same as /sim <name>.
- *  - `simocracy_unload_sim`  Same as /sim unload.
- *  - `simocracy_chat`        One-shot chat with a sim via OpenRouter (does
- *                            not change the active session persona).
+ *  - `simocracy_load_sim`           Same as /sim <name>.
+ *  - `simocracy_unload_sim`         Same as /sim unload.
+ *  - `simocracy_chat`               One-shot chat with a sim via
+ *                                   OpenRouter (does not change the
+ *                                   active session persona).
+ *  - `simocracy_run_interview`      Run /sim interview programmatically.
+ *  - `simocracy_derive_constitution`
+ *                                   Given interview answers, return the
+ *                                   derived constitution + style.
+ *  - `simocracy_training_profile`   Distill baseline + transcript into
+ *                                   a TrainingProfile.
+ *  - `simocracy_alignment_test`     Score a profile against a baseline.
+ *
+ * Note on /login: pi itself ships a built-in `/login` for Anthropic OAuth.
+ * To avoid the collision (and to make it explicit you're signing into
+ * ATProto, not Anthropic), all auth commands here are namespaced under
+ * `/sim`.
  */
 
 import type {
@@ -380,21 +425,57 @@ export default async function simocracy(pi: ExtensionAPI) {
 
   // -------------------------------------------------------------------------
   // Slash command: /sim
+  //
+  // All extension commands are namespaced under /sim to avoid colliding
+  // with pi's built-in slash commands (notably `/login` for Anthropic
+  // OAuth and `/logout`). That namespacing also makes it unambiguous to
+  // users that `/sim login` signs them into their ATProto / Bluesky
+  // account, NOT into Anthropic.
   // -------------------------------------------------------------------------
   pi.registerCommand("sim", {
     description:
-      "Load a Simocracy sim into your chat (or `/sim unload`, `/sim status`, `/sim interview`, `/sim train …`).",
+      "Simocracy: load/train sims, sign into ATProto. `/sim help` for the full list.",
     handler: async (args, ctx) => {
       const arg = args.trim();
       if (!arg || arg === "help" || arg === "--help") {
         ctx.ui.notify(
-          "Usage: /sim <name>            load a sim (e.g. /sim mr meow)\n" +
-            "       /sim unload            stop roleplaying\n" +
-            "       /sim status            show currently loaded sim\n" +
-            "       /sim interview [name]  run the interview flow on a sim\n" +
-            "       /sim train <subcmd>    Training Lab: baseline | chat | profile | feedback | alignment | apply | status | reset",
+          "Sim:\n" +
+            "  /sim <name>            load a sim (e.g. /sim mr meow)\n" +
+            "  /sim unload            stop roleplaying\n" +
+            "  /sim status            show currently loaded sim\n" +
+            "\n" +
+            "Constitution training (operates on the loaded sim):\n" +
+            "  /sim interview [name]  adaptive interview → derive constitution\n" +
+            "  /sim train baseline    vote on sample proposals\n" +
+            "  /sim train chat        conversational training round\n" +
+            "  /sim train profile     distill votes + chat → TrainingProfile\n" +
+            "  /sim train alignment   score sim against your baseline\n" +
+            "  /sim train apply       merge profile into constitution\n" +
+            "  /sim train status|reset|feedback\n" +
+            "\n" +
+            "Sign in with ATProto / Bluesky (not Anthropic — pi's built-in /login\n" +
+            "does that). Required before `--apply` writes to your PDS:\n" +
+            "  /sim login [handle]    OAuth loopback flow (e.g. /sim login alice.bsky.social)\n" +
+            "  /sim logout            clear local session\n" +
+            "  /sim whoami            show signed-in handle/DID",
           "info",
         );
+        return;
+      }
+      // ATProto auth subcommands — must come BEFORE the sim-name
+      // fallthrough (`runLoadFlow`) so we don't accidentally treat
+      // "login" as a sim name to load from the indexer.
+      if (arg === "login" || arg.startsWith("login ") || arg.startsWith("login\t")) {
+        const rest = arg.slice("login".length).trim();
+        await runLogin(ctx, rest);
+        return;
+      }
+      if (arg === "logout") {
+        await runLogout(ctx);
+        return;
+      }
+      if (arg === "whoami") {
+        await runWhoami(ctx);
         return;
       }
       if (arg === "unload" || arg === "clear") {
@@ -451,26 +532,22 @@ export default async function simocracy(pi: ExtensionAPI) {
   });
 
   // -------------------------------------------------------------------------
-  // Slash commands: /login, /logout, /whoami (ATProto OAuth)
+  // (Removed) top-level /login, /logout, /whoami slash commands.
+  //
+  // These collided with pi's own built-in `/login` (Anthropic OAuth) and
+  // `/logout`, which made pi emit "Skipping in autocomplete" warnings on
+  // every boot and silently degraded discoverability of these handlers.
+  // The auth flow now lives under `/sim login`, `/sim logout`,
+  // `/sim whoami` — no collision, and the namespacing makes it explicit
+  // to users that they're signing into their ATProto / Bluesky account,
+  // not Anthropic. See the dispatcher in the `/sim` registerCommand
+  // above.
+  //
+  // The `runLogin` / `runLogout` / `runWhoami` helpers in src/auth/
+  // commands.ts are unchanged — only the slash-command surface moved.
   // -------------------------------------------------------------------------
-  pi.registerCommand("login", {
-    description: "Sign in to your ATProto account via the loopback OAuth flow.",
-    handler: async (args, ctx) => {
-      await runLogin(ctx, args);
-    },
-  });
-  pi.registerCommand("logout", {
-    description: "Sign out and clear local OAuth tokens.",
-    handler: async (_args, ctx) => {
-      await runLogout(ctx);
-    },
-  });
-  pi.registerCommand("whoami", {
-    description: "Show the currently signed-in ATProto identity.",
-    handler: async (_args, ctx) => {
-      await runWhoami(ctx);
-    },
-  });
+  // (no top-level registration — the auth helpers `runLogin`, `runLogout`,
+  // `runWhoami` are dispatched from inside the `/sim` handler above.)
 
   // -------------------------------------------------------------------------
   // Tool: simocracy_load_sim
