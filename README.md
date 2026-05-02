@@ -1,0 +1,160 @@
+# pi-simocracy
+
+Load a [Simocracy](https://simocracy.org) sim into your [`pi`](https://github.com/mariozechner/pi-coding-agent) chat — see its
+pixel-art sprite render in the terminal and chat with the agent **as that sim**.
+
+```
+/sim mr meow
+```
+
+…fetches Mr Meow from Simocracy's ATProto indexer, renders his 32×32
+sprite as colored ANSI half-blocks directly in the chat, and pushes
+his constitution + speaking style into pi's system prompt so pi
+roleplays as Mr Meow until you `/sim unload`.
+
+![Mr Meow loaded inline in pi](demo/sim-load.gif)
+
+---
+
+## Install
+
+```bash
+pi install npm:pi-simocracy
+```
+
+That's it. Open `pi`, type `/sim mr meow`, and you're talking to the cat.
+
+For the optional `simocracy_chat` tool (one-shot conversation through
+OpenRouter without changing the active session persona), set
+`OPENROUTER_API_KEY` in your environment. The slash-command flow
+doesn't need it — it just rewrites pi's system prompt.
+
+---
+
+## Slash commands
+
+| Command          | What it does                                                |
+|------------------|-------------------------------------------------------------|
+| `/sim <name>`    | Load a sim by name (fuzzy search). Multiple matches → picker. |
+| `/sim <at-uri>`  | Load a sim by AT-URI directly (no search).                  |
+| `/sim status`    | Show which sim is currently loaded.                         |
+| `/sim unload`    | Drop the persona and break character cleanly.               |
+| `/sim help`      | Print usage.                                                |
+
+Examples:
+
+```
+/sim mr meow
+/sim Marie Curie
+/sim at://did:plc:qc42fmqqlsmdq7jiypiiigww/org.simocracy.sim/3mfo6vwfaka24
+/sim unload
+```
+
+---
+
+## LLM-callable tools
+
+The same actions are exposed to pi as tools, so the model can drive them itself:
+
+| Tool                     | Use when                                                        |
+|--------------------------|-----------------------------------------------------------------|
+| `simocracy_load_sim`     | Load a sim into the current session (sets the persona).         |
+| `simocracy_unload_sim`   | Stop roleplaying.                                               |
+| `simocracy_chat`         | Send one message to a sim and get a quoted reply, **without** changing the active session persona. Useful for "ask Mr Meow what he thinks of this PR." Requires `OPENROUTER_API_KEY`. |
+
+---
+
+## How it works
+
+1. **Search.** GraphQL query against the public Simocracy indexer
+   (`simocracy-indexer-production.up.railway.app`) for `org.simocracy.sim`
+   records, then client-side fuzzy ranking by exact match → prefix → substring → token overlap.
+2. **Resolve.** Parse the winning AT-URI, fetch the DID document from
+   `plc.directory` (or the `did:web` well-known URL), follow the
+   `#atproto_pds` service endpoint to find the owner's PDS.
+3. **Hydrate.** Pull three records from the PDS via
+   `com.atproto.repo.getRecord` / `listRecords`:
+   - `org.simocracy.sim`     — display name + sprite + avatar blob refs
+   - `org.simocracy.agents`  — short description + full constitution
+   - `org.simocracy.style`   — speaking style / mannerisms
+4. **Render.** Fetch the sprite-sheet blob (128×128 PNG, 4×4 of 32×32
+   walking frames) via `com.atproto.sync.getBlob`, decode with `pngjs`,
+   crop the front-facing walk-1 frame, emit as 24-bit ANSI using the
+   upper-half-block character `▀` so each terminal cell paints two
+   pixels. Transparent regions show pi's background through.
+5. **Inject.** A `before_agent_start` event handler appends the sim's
+   identity + constitution + speaking style to pi's system prompt **every
+   turn**. After `/sim unload`, a one-shot override fires on the next
+   turn telling the model to break character so it doesn't keep imitating
+   its own previous in-character replies.
+
+No background processes, no extra terminal windows, no AppleScript — pi
+keeps the terminal it's already running in.
+
+---
+
+## Files
+
+```
+src/
+├── index.ts        # extension entry: slash command, tools, persona injection
+├── simocracy.ts    # indexer + PDS client (read-only)
+├── png-to-ansi.ts  # RGBA half-block ANSI renderer
+└── openrouter.ts   # minimal OpenRouter client (only used by simocracy_chat)
+demo/
+└── sim-load.tape   # vhs tape — render with `vhs demo/sim-load.tape`
+```
+
+---
+
+## Local development
+
+```bash
+git clone https://github.com/GainForest/pi-simocracy
+cd pi-simocracy
+npm install                        # uses legacy-peer-deps (see .npmrc)
+pi -e $(pwd)/src/index.ts -ne -ns  # load the extension directly
+```
+
+Then in `pi`: `/sim mr meow`.
+
+To rebuild the demo recording:
+
+```bash
+brew install vhs                   # one-time
+vhs demo/sim-load.tape             # writes demo/sim-load.{webm,gif}
+```
+
+---
+
+## Required peer dependencies
+
+These come bundled with `pi` itself, so installing pi-simocracy via
+`pi install npm:pi-simocracy` already gives you everything:
+
+- `@mariozechner/pi-coding-agent` ≥ 0.58.0
+- `@mariozechner/pi-tui` ≥ 0.58.0
+
+Direct npm dependencies (auto-installed):
+
+- `pngjs` — PNG decoder for sprite blobs
+- `typebox` — tool parameter schemas
+
+---
+
+## Related
+
+- **Simocracy** — the governance simulation that mints these sims:
+  [simocracy.org](https://simocracy.org)
+- **pi** — Mario Zechner's terminal coding agent that hosts the
+  extension: [`@mariozechner/pi-coding-agent`](https://github.com/mariozechner/pi-coding-agent)
+- **OpenTUI experiments** — earlier prototype that spawned a separate
+  Bun + OpenTUI window with an animated walking-cat scene. Removed in
+  favour of the inline ANSI render. The git history still has it if
+  you want the animated version back.
+
+---
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
