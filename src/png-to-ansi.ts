@@ -190,3 +190,103 @@ export function cropRgba(
   }
   return out;
 }
+
+/**
+ * Downscale an RGBA buffer by an integer factor using nearest-neighbour
+ * sampling. Designed for pixel-art images that were upscaled with no
+ * filtering — sampling the centre pixel of each source block recovers
+ * the original art losslessly.
+ *
+ * Returns the new buffer plus its dimensions. Throws if `factor < 1` or
+ * source dimensions aren't divisible by it.
+ */
+export function downscaleRgbaNearest(
+  data: Buffer,
+  width: number,
+  height: number,
+  factor: number,
+): { data: Buffer; width: number; height: number } {
+  if (factor < 1 || !Number.isInteger(factor)) {
+    throw new Error(`downscale factor must be a positive integer, got ${factor}`);
+  }
+  if (factor === 1) return { data, width, height };
+  if (width % factor !== 0 || height % factor !== 0) {
+    throw new Error(
+      `downscale ${factor}× needs ${width}×${height} divisible by ${factor}`,
+    );
+  }
+  const newW = width / factor;
+  const newH = height / factor;
+  const out = Buffer.alloc(newW * newH * 4);
+  // Sample the centre pixel of each factor×factor block.
+  const offset = Math.floor(factor / 2);
+  for (let y = 0; y < newH; y++) {
+    const srcY = y * factor + offset;
+    for (let x = 0; x < newW; x++) {
+      const srcX = x * factor + offset;
+      const srcIdx = (srcY * width + srcX) * 4;
+      const dstIdx = (y * newW + x) * 4;
+      out[dstIdx] = data[srcIdx];
+      out[dstIdx + 1] = data[srcIdx + 1];
+      out[dstIdx + 2] = data[srcIdx + 2];
+      out[dstIdx + 3] = data[srcIdx + 3];
+    }
+  }
+  return { data: out, width: newW, height: newH };
+}
+
+/**
+ * Detect the integer upscale factor of a pixel-art image by scanning
+ * for the largest factor F where every F×F block has uniform colour.
+ *
+ * For Simocracy avatars this returns 4 (a 32×32 sprite displayed as a
+ * 128×128 PNG). For native-resolution images it returns 1. Falls back
+ * to 1 if no consistent factor fits.
+ *
+ * Tests up to maxFactor (default 8) and only checks factors that
+ * cleanly divide both dimensions.
+ */
+export function detectPixelArtScale(
+  data: Buffer,
+  width: number,
+  height: number,
+  maxFactor = 8,
+): number {
+  for (let f = Math.min(maxFactor, width, height); f >= 2; f--) {
+    if (width % f !== 0 || height % f !== 0) continue;
+    if (isUniformAtFactor(data, width, height, f)) return f;
+  }
+  return 1;
+}
+
+function isUniformAtFactor(
+  data: Buffer,
+  width: number,
+  height: number,
+  factor: number,
+): boolean {
+  for (let by = 0; by < height; by += factor) {
+    for (let bx = 0; bx < width; bx += factor) {
+      const baseIdx = (by * width + bx) * 4;
+      const r = data[baseIdx];
+      const g = data[baseIdx + 1];
+      const b = data[baseIdx + 2];
+      const a = data[baseIdx + 3];
+      for (let dy = 0; dy < factor; dy++) {
+        for (let dx = 0; dx < factor; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const idx = ((by + dy) * width + (bx + dx)) * 4;
+          if (
+            data[idx] !== r ||
+            data[idx + 1] !== g ||
+            data[idx + 2] !== b ||
+            data[idx + 3] !== a
+          ) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+  return true;
+}

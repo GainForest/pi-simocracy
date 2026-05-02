@@ -35,7 +35,13 @@ import {
   type SimMatch,
   type StyleRecord,
 } from "./simocracy.ts";
-import { decodePng, renderRgbaToAnsi, cropRgba } from "./png-to-ansi.ts";
+import {
+  decodePng,
+  renderRgbaToAnsi,
+  cropRgba,
+  detectPixelArtScale,
+  downscaleRgbaNearest,
+} from "./png-to-ansi.ts";
 import { openRouterComplete, type ChatMessage } from "./openrouter.ts";
 
 // ---------------------------------------------------------------------------
@@ -119,7 +125,16 @@ async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
     try {
       const buf = await fetchBlob(sim.did, imageLink);
       const { width, height, data } = decodePng(buf);
-      return renderRgbaToAnsi(data, width, height, {
+      // Old sims (pre-sprite-sheet) only have the avatar PNG, which
+      // simocracy.org renders by 4×-upscaling a native 32×32 sprite into
+      // a 128×128 image with nearest-neighbour. Detect that and downsample
+      // back to the original size so the inline render is the same
+      // ~13-line height as a sprite-sheet-equipped sim instead of
+      // ballooning to ~22 lines and pushing chat off-screen.
+      const scale = detectPixelArtScale(data, width, height, 8);
+      const native =
+        scale > 1 ? downscaleRgbaNearest(data, width, height, scale) : { data, width, height };
+      return renderRgbaToAnsi(native.data, native.width, native.height, {
         cropToContent: true,
         cropPad: 1,
         indent: 2,
