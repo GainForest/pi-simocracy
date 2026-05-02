@@ -40,7 +40,9 @@ export async function runTrainCommand(
   arg: string,
   loadedSim: LoadedSim | null,
 ): Promise<void> {
-  const sub = arg.trim().split(/\s+/)[0] ?? "";
+  const tokens = arg.trim().split(/\s+/).filter(Boolean);
+  const sub = tokens[0] ?? "";
+  const flags = new Set(tokens.slice(1));
 
   if (!sub || sub === "help" || sub === "--help") {
     ctx.ui.notify(HELP, "info");
@@ -81,7 +83,7 @@ export async function runTrainCommand(
       await runAlignment(ctx, loadedSim);
       return;
     case "apply":
-      await runApply(ctx, loadedSim);
+      await runApply(ctx, loadedSim, { apply: flags.has("--apply") });
       return;
     default:
       ctx.ui.notify(`Unknown subcommand: ${sub}\n\n${HELP}`, "error");
