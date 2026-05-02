@@ -41,6 +41,13 @@
  *  - `/sim logout`        Clear the local OAuth session.
  *  - `/sim whoami`        Show the currently signed-in ATProto handle/DID.
  *
+ * Browse your own sims (requires `/sim login`):
+ *  - `/sim my`            List the org.simocracy.sim records owned by
+ *                         the signed-in DID, newest first. Mirrors
+ *                         simocracy.org's My Sims page in terminal form.
+ *  - `/sim my <n>`        Load sim #n from that list (1-indexed).
+ *  - `/sim my <name>`     Fuzzy-load by name within your own sims.
+ *
  * Tools (LLM-callable):
  *  - `simocracy_load_sim`           Same as /sim <name>.
  *  - `simocracy_unload_sim`         Same as /sim unload.
@@ -71,6 +78,7 @@ import { Type } from "typebox";
 
 import {
   searchSimsByName,
+  fetchSimsForDid,
   fetchAgentsForSim,
   fetchStyleForSim,
   fetchBlob,
@@ -110,6 +118,7 @@ import type {
   Vote,
 } from "./training/types.ts";
 import { runLogin, runLogout, runWhoami } from "./auth/commands.ts";
+import { readAuth } from "./auth/storage.ts";
 
 // ---------------------------------------------------------------------------
 // State
@@ -457,7 +466,12 @@ export default async function simocracy(pi: ExtensionAPI) {
             "does that). Required before `--apply` writes to your PDS:\n" +
             "  /sim login [handle]    OAuth loopback flow (e.g. /sim login alice.bsky.social)\n" +
             "  /sim logout            clear local session\n" +
-            "  /sim whoami            show signed-in handle/DID",
+            "  /sim whoami            show signed-in handle/DID\n" +
+            "\n" +
+            "Browse your own sims (requires /sim login):\n" +
+            "  /sim my                list sims you own on your PDS\n" +
+            "  /sim my <n>            load sim #n from that list\n" +
+            "  /sim my <name>         fuzzy-load by name within your sims",
           "info",
         );
         return;
@@ -476,6 +490,12 @@ export default async function simocracy(pi: ExtensionAPI) {
       }
       if (arg === "whoami") {
         await runWhoami(ctx);
+        return;
+      }
+      if (arg === "my" || arg === "mine" || arg.startsWith("my ") || arg.startsWith("my\t") || arg.startsWith("mine ") || arg.startsWith("mine\t")) {
+        const headLen = arg.startsWith("mine") ? 4 : 2;
+        const rest = arg.slice(headLen).trim();
+        await runMySimsCommand(pi, ctx, rest);
         return;
       }
       if (arg === "unload" || arg === "clear") {
@@ -858,6 +878,172 @@ export default async function simocracy(pi: ExtensionAPI) {
 // ---------------------------------------------------------------------------
 // Slash-command flow
 // ---------------------------------------------------------------------------
+
+/**
+ * `/sim my [arg]` — list (and optionally load) sims owned by the
+ * currently signed-in DID. Three calling conventions, picked by
+ * cheapest-first:
+ *
+ *   - bare `/sim my`           →  print a numbered list, no load
+ *   - `/sim my <n>` (digits)   →  load the n-th sim from the list
+ *   - `/sim my <text>`         →  fuzzy-match by name within the user's
+ *                                sims (uses the same scoring as the
+ *                                global indexer search), load the best.
+ *                                If two of the user's sims share a name
+ *                                we prompt with a select. AT-URIs are
+ *                                not allowed here — use `/sim <at-uri>`
+ *                                directly for that.
+ *
+ * Reads the user's sims from their PDS via `com.atproto.repo.listRecords`
+ * (no DPoP needed for reads of the public collection), so this works
+ * even if the OAuth session has expired — it only needs the DID, which
+ * the auth.json keeps after `lastLogin` is stale.
+ */
+async function runMySimsCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  arg: string,
+): Promise<void> {
+  const auth = readAuth();
+  if (!auth) {
+    ctx.ui.notify(
+      "Not signed into ATProto. Run `/sim login <handle>` first (e.g. `/sim login alice.bsky.social`) so /sim my knows which DID's repo to list.",
+      "error",
+    );
+    return;
+  }
+
+  ctx.ui.notify(`Listing sims owned by ${auth.handle ? `@${auth.handle}` : auth.did}\u2026`, "info");
+
+  let mySims: SimMatch[];
+  try {
+    mySims = await fetchSimsForDid(auth.did);
+  } catch (err) {
+    ctx.ui.notify(
+      `Could not list sims from your PDS: ${(err as Error).message}. Is the DID document still resolvable?`,
+      "error",
+    );
+    return;
+  }
+
+  if (mySims.length === 0) {
+    ctx.ui.notify(
+      auth.handle
+        ? `@${auth.handle} doesn't own any sims yet. Visit https://simocracy.org/my-sims to create one, then come back and try /sim my again.`
+        : `No sims found on this PDS. Create one at https://simocracy.org/my-sims and try again.`,
+      "info",
+    );
+    return;
+  }
+
+  // Bare `/sim my` — just list. Indented so the chat treats this as
+  // a content message (notify is best for short feedback; for the
+  // list we want fixed-width alignment so we go through the registered
+  // message renderer that the load flow already uses for sim summaries).
+  if (!arg) {
+    const lines: string[] = [];
+    lines.push(`📁 ${mySims.length} sim${mySims.length === 1 ? "" : "s"} owned by ${auth.handle ? `@${auth.handle}` : auth.did}:`);
+    lines.push("");
+    const maxNameLen = Math.min(
+      32,
+      mySims.reduce((m, s) => Math.max(m, s.sim.name.length), 0),
+    );
+    mySims.forEach((s, i) => {
+      const idx = String(i + 1).padStart(2, " ");
+      const name = s.sim.name.length > maxNameLen ? s.sim.name.slice(0, maxNameLen - 1) + "…" : s.sim.name.padEnd(maxNameLen, " ");
+      const created = (s.sim.createdAt || "").slice(0, 10);
+      lines.push(`  ${idx}. ${name}  ${created}  at://…/${s.rkey}`);
+    });
+    lines.push("");
+    lines.push("Load one with `/sim my <n>` (e.g. `/sim my 1`) or `/sim my <name>`.");
+    ctx.ui.notify(lines.join("\n"), "info");
+    return;
+  }
+
+  // `/sim my <n>` — numeric index into the list above.
+  if (/^\d+$/.test(arg)) {
+    const n = parseInt(arg, 10);
+    if (n < 1 || n > mySims.length) {
+      ctx.ui.notify(
+        `No sim #${n} — you have ${mySims.length}. Run /sim my (no args) to see the list.`,
+        "error",
+      );
+      return;
+    }
+    await loadAndPostMySim(pi, ctx, mySims[n - 1]);
+    return;
+  }
+
+  // `/sim my <name>` — fuzzy-match within the user's own sims.
+  const matches = fuzzyMatchOwnedSims(mySims, arg);
+  if (matches.length === 0) {
+    ctx.ui.notify(
+      `No sim matching "${arg}" in your ${mySims.length} sim${mySims.length === 1 ? "" : "s"}. Run /sim my (no args) to see them.`,
+      "error",
+    );
+    return;
+  }
+  let chosen = matches[0];
+  if (matches.length > 1 && matches[0].score > 0) {
+    // Multiple non-exact matches — ask. Skip the prompt for an exact match.
+    const labels = matches.map((m) => `${m.sim.sim.name}  —  at://…/${m.sim.rkey}`);
+    const picked = await ctx.ui.select(`Multiple matches for "${arg}" in your sims`, labels);
+    if (!picked) {
+      ctx.ui.notify("Cancelled.", "info");
+      return;
+    }
+    chosen = matches[labels.indexOf(picked)];
+  }
+  await loadAndPostMySim(pi, ctx, chosen.sim);
+}
+
+async function loadAndPostMySim(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  match: SimMatch,
+): Promise<void> {
+  ctx.ui.notify(`Loading ${match.sim.name}…`, "info");
+  let sim: LoadedSim;
+  try {
+    sim = await hydrateLoadedSim(match);
+  } catch (err) {
+    ctx.ui.notify(`Failed to load sim: ${(err as Error).message}`, "error");
+    return;
+  }
+  loadedSim = sim;
+  await postSimToChat(pi, ctx, sim, true);
+}
+
+/**
+ * Score user-owned sims against a query string. Returns matches sorted
+ * best-first. Score 0 = exact name match (prompt-suppressing), higher =
+ * worse. Mirrors the heuristic the indexer search uses but constrained
+ * to the already-fetched list, so this is purely client-side and no
+ * extra HTTP calls are issued.
+ */
+function fuzzyMatchOwnedSims(
+  sims: SimMatch[],
+  query: string,
+): Array<{ sim: SimMatch; score: number }> {
+  const q = query.toLowerCase().trim();
+  const out: Array<{ sim: SimMatch; score: number }> = [];
+  for (const sim of sims) {
+    const name = sim.sim.name.toLowerCase().trim();
+    let score = Number.POSITIVE_INFINITY;
+    if (name === q) score = 0;
+    else if (name.replace(/\s+/g, "") === q.replace(/\s+/g, "")) score = 1;
+    else if (name.startsWith(q)) score = 2;
+    else if (name.includes(q)) score = 3 + (name.length - q.length);
+    else {
+      const tokens = q.split(/\s+/).filter(Boolean);
+      const matched = tokens.filter((t) => name.includes(t)).length;
+      if (matched > 0) score = 100 - matched;
+    }
+    if (Number.isFinite(score)) out.push({ sim, score });
+  }
+  out.sort((a, b) => a.score - b.score);
+  return out;
+}
 
 async function runLoadFlow(
   pi: ExtensionAPI,

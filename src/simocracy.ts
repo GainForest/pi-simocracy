@@ -254,6 +254,37 @@ export async function listRecordsFromPds<T>(did: string, collection: string): Pr
   return out;
 }
 
+/**
+ * List every `org.simocracy.sim` record owned by `did`, mapped onto the
+ * same `SimMatch` shape that `searchSimsByName` produces so the rest of
+ * the extension's load/hydrate pipeline accepts these without a second
+ * code path. Sorted by `createdAt` descending (most recently created
+ * first), since that's how simocracy.org's My Sims carousel surfaces
+ * them and it's the most useful ordering when the user types `/sim my 1`.
+ */
+export async function fetchSimsForDid(did: string): Promise<SimMatch[]> {
+  const records = await listRecordsFromPds<SimRecord>(did, COLLECTION_SIM);
+  return records
+    .filter((r) => r.value && typeof r.value.name === "string")
+    .map((r) => {
+      const rkey = r.uri.split("/").pop() ?? "";
+      return {
+        uri: r.uri,
+        cid: r.cid,
+        did,
+        rkey,
+        sim: r.value,
+      } satisfies SimMatch;
+    })
+    .sort((a, b) => {
+      // Most recent first; fall back to rkey (TIDs are roughly monotonic).
+      const ta = a.sim.createdAt || "";
+      const tb = b.sim.createdAt || "";
+      if (ta && tb) return tb.localeCompare(ta);
+      return b.rkey.localeCompare(a.rkey);
+    });
+}
+
 /** Find the agents record for a sim by scanning the owner's PDS (sim-1:1-agents). */
 export async function fetchAgentsForSim(simUri: string): Promise<AgentsRecord | null> {
   const { did } = parseAtUri(simUri);
