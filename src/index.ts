@@ -43,23 +43,31 @@ import {
   downscaleRgbaNearest,
 } from "./png-to-ansi.ts";
 import { openRouterComplete, type ChatMessage } from "./openrouter.ts";
+import { buildSimPrompt, type LoadedSim } from "./persona.ts";
+import { runTrainCommand } from "./training/index.ts";
+import {
+  runInterviewFlow,
+  snapshotInterviewTemplate,
+  deriveFromInterview,
+} from "./interview.ts";
+import { deriveProfile, printProfile } from "./training/profile.ts";
+import {
+  loadTrainingLabState,
+  saveTrainingLabState,
+} from "./training/storage.ts";
+import { scoreAlignment, printAlignment } from "./training/alignment.ts";
+import type {
+  AlignmentResult,
+  BaselineProposal,
+  BaselineVote,
+  InterviewTurn,
+  TrainingProfile,
+  Vote,
+} from "./training/types.ts";
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-
-interface LoadedSim {
-  uri: string;
-  did: string;
-  rkey: string;
-  name: string;
-  handle: string | null;
-  shortDescription?: string;
-  description?: string;
-  style?: string;
-  /** Pre-rendered colored ANSI art of the sim's sprite (4 walk frames). */
-  spriteAnsi?: string;
-}
 
 let loadedSim: LoadedSim | null = null;
 /**
@@ -145,41 +153,6 @@ async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
     }
   }
   return null;
-}
-
-function buildSimPrompt(sim: LoadedSim): string {
-  const lines: string[] = [];
-  lines.push(`# Simocracy roleplay`);
-  lines.push(
-    `You are now roleplaying as **${sim.name}**, a Simocracy sim — a simulated political agent in a decentralized governance simulation built on the AT Protocol.`,
-  );
-  lines.push(
-    `Stay in character at all times. Respond as ${sim.name} would — with their beliefs, values, and personality. Use first person. Don't break character or mention that you are an AI.`,
-  );
-  if (sim.handle) lines.push(`The sim's owner on ATProto is @${sim.handle} (${sim.did}).`);
-  if (sim.shortDescription) {
-    lines.push(``);
-    lines.push(`## ${sim.name}'s identity`);
-    lines.push(sim.shortDescription);
-  }
-  if (sim.description) {
-    lines.push(``);
-    lines.push(`## ${sim.name}'s constitution`);
-    lines.push(sim.description);
-  }
-  if (sim.style) {
-    lines.push(``);
-    lines.push(`## ${sim.name}'s speaking style`);
-    lines.push(sim.style);
-  }
-  lines.push(``);
-  lines.push(
-    `When the user asks you to use any of pi's tools (read, edit, bash, etc.), you should still use them — you're ${sim.name} *with access to a developer's terminal*. Just narrate tool use the way ${sim.name} would talk about it.`,
-  );
-  lines.push(
-    `Keep replies conversational unless the user explicitly asks for code or a long answer.`,
-  );
-  return lines.join("\n");
 }
 
 async function loadSimByName(query: string): Promise<{
@@ -275,6 +248,96 @@ const ChatToolParams = Type.Object({
 
 const UnloadToolParams = Type.Object({});
 
+const RunInterviewToolParams = Type.Object({
+  sim: Type.Optional(
+    Type.String({
+      description:
+        "Sim name or AT-URI to interview. Defaults to the currently loaded sim if omitted.",
+    }),
+  ),
+  templateUri: Type.Optional(
+    Type.String({
+      description:
+        "AT-URI of an `org.simocracy.interviewTemplate` to use. Skips the picker.",
+    }),
+  ),
+});
+
+const OpenAnswerSchema = Type.Object({
+  question: Type.String(),
+  answer: Type.String(),
+});
+const YesNoAnswerSchema = Type.Object({
+  statement: Type.String(),
+  answer: Type.Boolean(),
+});
+
+const DeriveConstitutionToolParams = Type.Object({
+  openAnswers: Type.Optional(Type.Array(OpenAnswerSchema)),
+  yesNoAnswers: Type.Optional(Type.Array(YesNoAnswerSchema)),
+});
+
+const BaselineProposalSchema = Type.Object({
+  id: Type.String(),
+  title: Type.String(),
+  summary: Type.String(),
+  topic: Type.String(),
+});
+const BaselineVoteSchema = Type.Object({
+  proposalId: Type.String(),
+  vote: Type.Union([Type.Literal("yes"), Type.Literal("no"), Type.Literal("abstain")]),
+  importance: Type.Number(),
+  reasoning: Type.String(),
+});
+const InterviewTurnSchema = Type.Object({
+  role: Type.Union([Type.Literal("assistant"), Type.Literal("user")]),
+  content: Type.String(),
+  target: Type.Optional(Type.String()),
+});
+const IssuePrioritySchema = Type.Object({
+  issue: Type.String(),
+  stance: Type.String(),
+  importance: Type.Number(),
+  negotiability: Type.Number(),
+  confidence: Type.Number(),
+});
+const TrainingProfileSchema = Type.Object({
+  summary: Type.String(),
+  coreValues: Type.Array(Type.String()),
+  issuePriorities: Type.Array(IssuePrioritySchema),
+  redLines: Type.Array(Type.String()),
+  acceptableTradeoffs: Type.Array(Type.String()),
+  uncertaintyAreas: Type.Array(Type.String()),
+  representationRules: Type.Array(Type.String()),
+});
+
+const TrainingProfileToolParams = Type.Object({
+  simName: Type.String({ description: "The sim's display name." }),
+  existingConstitution: Type.Optional(Type.String()),
+  baselineVotes: Type.Array(BaselineVoteSchema),
+  baselineProposals: Type.Array(BaselineProposalSchema),
+  transcript: Type.Array(InterviewTurnSchema),
+});
+
+const AlignmentProposalSchema = Type.Object({
+  id: Type.String(),
+  title: Type.String(),
+  summary: Type.String(),
+  topic: Type.String(),
+  userVote: Type.Union([
+    Type.Literal("yes"),
+    Type.Literal("no"),
+    Type.Literal("abstain"),
+  ]),
+});
+
+const AlignmentTestToolParams = Type.Object({
+  simName: Type.String({ description: "The sim's display name." }),
+  existingConstitution: Type.Optional(Type.String()),
+  profile: TrainingProfileSchema,
+  proposals: Type.Array(AlignmentProposalSchema),
+});
+
 export default async function simocracy(pi: ExtensionAPI) {
   // -------------------------------------------------------------------------
   // System prompt injection — every turn the loaded sim's persona is appended.
@@ -318,14 +381,17 @@ export default async function simocracy(pi: ExtensionAPI) {
   // Slash command: /sim
   // -------------------------------------------------------------------------
   pi.registerCommand("sim", {
-    description: "Load a Simocracy sim into your chat (or `/sim unload`, `/sim status`).",
+    description:
+      "Load a Simocracy sim into your chat (or `/sim unload`, `/sim status`, `/sim interview`, `/sim train …`).",
     handler: async (args, ctx) => {
       const arg = args.trim();
       if (!arg || arg === "help" || arg === "--help") {
         ctx.ui.notify(
           "Usage: /sim <name>            load a sim (e.g. /sim mr meow)\n" +
             "       /sim unload            stop roleplaying\n" +
-            "       /sim status            show currently loaded sim",
+            "       /sim status            show currently loaded sim\n" +
+            "       /sim interview [name]  run the interview flow on a sim\n" +
+            "       /sim train <subcmd>    Training Lab: baseline | chat | profile | feedback | alignment | apply | status | reset",
           "info",
         );
         return;
@@ -349,6 +415,30 @@ export default async function simocracy(pi: ExtensionAPI) {
           return;
         }
         await postSimToChat(pi, ctx, loadedSim, /*reload=*/ false);
+        return;
+      }
+      if (arg === "interview" || arg.startsWith("interview ") || arg.startsWith("interview\t")) {
+        const rest = arg.slice("interview".length).trim();
+        if (rest && !loadedSim) {
+          // Load the named sim first.
+          const sim = await tryLoadFromQuery(rest);
+          if (!sim) {
+            ctx.ui.notify(`No sim found matching "${rest}".`, "error");
+            return;
+          }
+          loadedSim = sim;
+          await postSimToChat(pi, ctx, sim, /*reload=*/ true);
+        }
+        if (!loadedSim) {
+          ctx.ui.notify("No sim loaded. Use `/sim <name>` first or pass a name to `/sim interview <name>`.", "error");
+          return;
+        }
+        await runInterviewFlow(pi, ctx, loadedSim);
+        return;
+      }
+      if (arg === "train" || arg.startsWith("train ") || arg.startsWith("train\t")) {
+        const rest = arg.slice("train".length).trim();
+        await runTrainCommand(ctx, rest, loadedSim);
         return;
       }
       await runLoadFlow(pi, ctx, arg);
@@ -457,7 +547,209 @@ export default async function simocracy(pi: ExtensionAPI) {
       };
     },
   });
+
+  // -------------------------------------------------------------------------
+  // Tool: simocracy_run_interview — run the interview questionnaire.
+  // -------------------------------------------------------------------------
+  pi.registerTool({
+    name: "simocracy_run_interview",
+    label: "Run Simocracy interview",
+    description:
+      "Run the Simocracy interview questionnaire on the loaded sim and return the captured open + yes/no answers. With UI, drives the user through the questions interactively. Without UI, returns the structure of the chosen template as a planning aid (no answers).",
+    parameters: RunInterviewToolParams,
+    async execute(_id, { sim, templateUri }, _signal, _onUpdate, ctx) {
+      if (ctx.hasUI) {
+        let target: LoadedSim | null = loadedSim;
+        if (sim) {
+          const loaded = await tryLoadFromQuery(sim);
+          if (!loaded) throw new Error(`No sim found matching "${sim}".`);
+          loadedSim = loaded;
+          target = loaded;
+          await postSimToChat(pi, ctx, loaded, true);
+        }
+        if (!target) throw new Error("No sim loaded. Pass `sim` or call simocracy_load_sim first.");
+        const out = await runInterviewFlow(pi, ctx as ExtensionCommandContext, target, {
+          templateUri,
+        });
+        if (!out) {
+          return {
+            content: [{ type: "text" as const, text: "Interview cancelled." }],
+            details: { cancelled: true },
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Captured ${out.result.openAnswers.length} open answers and ${out.result.yesNoAnswers.length} value positions.`,
+            },
+          ],
+          details: out.result,
+        };
+      }
+      // No UI: return the template snapshot as a planning aid.
+      const snapshot = await snapshotInterviewTemplate(templateUri);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Interview template "${snapshot.name}" — ${snapshot.questions.length} questions. ` +
+              `Run from a UI session to capture answers.`,
+          },
+        ],
+        details: { template: snapshot, openAnswers: [], yesNoAnswers: [] },
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: simocracy_derive_constitution — turn answers into constitution+style.
+  // -------------------------------------------------------------------------
+  pi.registerTool({
+    name: "simocracy_derive_constitution",
+    label: "Derive Simocracy constitution",
+    description:
+      "Given an interview's open + yes/no answers, derive a sim constitution (short description + markdown body) and a speaking style. Returns plain markdown — no PDS write happens here.",
+    parameters: DeriveConstitutionToolParams,
+    async execute(_id, { openAnswers, yesNoAnswers }) {
+      const sim: LoadedSim = loadedSim ?? {
+        uri: "",
+        did: "",
+        rkey: "",
+        name: "Sim",
+        handle: null,
+      };
+      const derived = await deriveFromInterview(sim, {
+        openAnswers: openAnswers ?? [],
+        yesNoAnswers: yesNoAnswers ?? [],
+      });
+      if (!derived) {
+        throw new Error("Could not parse derive-from-interview model output.");
+      }
+      const summary = [
+        `Short description:`,
+        derived.constitution.shortDescription,
+        ``,
+        `Constitution:`,
+        derived.constitution.description,
+        ``,
+        `Speaking style:`,
+        derived.style.description,
+      ].join("\n");
+      return {
+        content: [{ type: "text" as const, text: summary }],
+        details: derived,
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: simocracy_training_profile — distill into a TrainingProfile.
+  // -------------------------------------------------------------------------
+  pi.registerTool({
+    name: "simocracy_training_profile",
+    label: "Distill Simocracy training profile",
+    description:
+      "Distill a baseline questionnaire + interview transcript into a structured TrainingProfile (summary, core values, issue priorities, red lines, etc.). Read-only — does not write to the sim.",
+    parameters: TrainingProfileToolParams,
+    async execute(_id, params) {
+      const sim: LoadedSim = loadedSim ?? {
+        uri: "",
+        did: "",
+        rkey: "",
+        name: params.simName,
+        handle: null,
+        description: params.existingConstitution,
+      };
+      const stateSnapshot = {
+        baselineVotes: params.baselineVotes as BaselineVote[],
+        interviewTurns: params.transcript as InterviewTurn[],
+        feedbackTurns: [] as never[],
+        profile: null as TrainingProfile | null,
+        alignment: null as AlignmentResult | null,
+        updatedAt: new Date().toISOString(),
+      };
+      const profile = await deriveProfile(
+        { ...sim, description: params.existingConstitution ?? sim.description },
+        stateSnapshot,
+        params.baselineProposals as BaselineProposal[],
+      );
+      if (!profile) throw new Error("Could not parse training profile from model output.");
+      if (loadedSim && loadedSim.rkey) {
+        const persisted = loadTrainingLabState(loadedSim.rkey);
+        saveTrainingLabState(loadedSim.rkey, { ...persisted, profile, alignment: null });
+      }
+      try {
+        printProfile(profile);
+      } catch {
+        /* best effort */
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Distilled profile: ${profile.coreValues.length} core values, ${profile.issuePriorities.length} issue priorities, ${profile.redLines.length} red lines.`,
+          },
+        ],
+        details: profile,
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: simocracy_alignment_test — score the sim against baseline votes.
+  // -------------------------------------------------------------------------
+  pi.registerTool({
+    name: "simocracy_alignment_test",
+    label: "Run Simocracy alignment test",
+    description:
+      "Run the loaded sim's training profile against a list of proposals (each with the user's hidden vote) and return per-proposal match/mismatch + an overall match percentage. Calls the alignment prompt once per proposal at concurrency 4.",
+    parameters: AlignmentTestToolParams,
+    async execute(_id, params) {
+      const sim: LoadedSim = loadedSim ?? {
+        uri: "",
+        did: "",
+        rkey: "",
+        name: params.simName,
+        handle: null,
+        description: params.existingConstitution,
+      };
+      const aligned = (params.proposals as Array<BaselineProposal & { userVote: Vote }>).map(
+        (p) => ({
+          proposal: { id: p.id, title: p.title, summary: p.summary, topic: p.topic },
+          userVote: p.userVote,
+        }),
+      );
+      const alignment = await scoreAlignment(
+        { ...sim, description: params.existingConstitution ?? sim.description },
+        params.profile as TrainingProfile,
+        aligned,
+      );
+      if (loadedSim && loadedSim.rkey) {
+        const persisted = loadTrainingLabState(loadedSim.rkey);
+        saveTrainingLabState(loadedSim.rkey, { ...persisted, alignment });
+      }
+      try {
+        printAlignment(alignment, aligned);
+      } catch {
+        /* not in UI mode — printing is best-effort */
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Alignment: ${alignment.matchedCount}/${alignment.totalCount} matched. Weak areas: ${
+              alignment.weakAreas.length ? alignment.weakAreas.join(", ") : "none"
+            }.`,
+          },
+        ],
+        details: alignment,
+      };
+    },
+  });
 }
+
 
 // ---------------------------------------------------------------------------
 // Slash-command flow
