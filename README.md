@@ -1,18 +1,28 @@
 # pi-simocracy
 
 Load a [Simocracy](https://simocracy.org) sim into your [`pi`](https://github.com/mariozechner/pi-coding-agent) chat — see its
-pixel-art sprite render in the terminal and chat with the agent **as that sim**.
+sprite render in the terminal and chat with the agent **as that sim**.
 
 ```
 /sim mr meow
 ```
 
 …fetches Mr Meow from Simocracy's ATProto indexer, renders his 32×32
-sprite as colored ANSI half-blocks directly in the chat, and pushes
-his constitution + speaking style into pi's system prompt so pi
+pixel-art sprite as colored ANSI half-blocks directly in the chat, and
+pushes his constitution + speaking style into pi's system prompt so pi
 roleplays as Mr Meow until you `/sim unload`.
 
-![Mr Meow loaded inline in pi](demo/sim-load.gif)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/GainForest/pi-simocracy/main/demo/sim-load.gif" alt="Mr Meow (a pipoya pixel-art cat) loaded inline in pi's chat" width="760">
+</p>
+
+As of v0.4.0, codex pet sims (OpenAI hatch-pet skill output) render too —
+load **Einstein** with `/sim einstein` and the WebP atlas decodes, the
+idle frame crops, and the half-block ANSI render fires inline:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/GainForest/pi-simocracy/main/demo/codex-pet-load.gif" alt="Einstein (a codex pet sim with a WebP petSheet) loaded inline in pi's chat" width="760">
+</p>
 
 ---
 
@@ -136,16 +146,17 @@ keeps the terminal it's already running in.
 
 ```
 src/
-├── index.ts        # extension entry: slash command, tools, persona injection
-├── persona.ts      # buildSimPrompt(sim) — the system-prompt fragment
-├── simocracy.ts    # indexer + PDS client (read-only fetchers)
-├── writes.ts       # PDS writers + ownership / sign-in preconditions
-├── png-to-ansi.ts  # RGBA half-block ANSI renderer + downscalers
-├── webp-to-rgba.ts # @jsquash/webp wrapper for codex pet WebP sheets
-├── openrouter.ts   # minimal OpenRouter client (only used by simocracy_chat)
-└── auth/           # ATProto OAuth loopback flow + session storage
+├── index.ts          # extension entry: slash command, tools, persona injection
+├── persona.ts        # buildSimPrompt(sim) — the system-prompt fragment
+├── simocracy.ts      # indexer + PDS client (read-only fetchers)
+├── writes.ts         # PDS writers + ownership / sign-in preconditions
+├── png-to-ansi.ts    # RGBA half-block ANSI renderer + downscalers
+├── webp-to-rgba.ts   # @jsquash/webp wrapper for codex pet WebP sheets
+├── openrouter.ts     # minimal OpenRouter client (only used by simocracy_chat)
+└── auth/             # ATProto OAuth loopback flow + session storage
 demo/
-└── sim-load.tape   # vhs tape — render with `vhs demo/sim-load.tape`
+├── sim-load.tape       # vhs tape — Mr Meow (pipoya)
+└── codex-pet-load.tape # vhs tape — Einstein (codex pet)
 ```
 
 ---
@@ -161,11 +172,12 @@ pi -e $(pwd)/src/index.ts -ne -ns  # load the extension directly
 
 Then in `pi`: `/sim mr meow`.
 
-To rebuild the demo recording:
+To rebuild the demo recordings:
 
 ```bash
 brew install vhs                   # one-time
-vhs demo/sim-load.tape             # writes demo/sim-load.{webm,gif}
+vhs demo/sim-load.tape             # Mr Meow (pipoya) — demo/sim-load.{webm,gif}
+vhs demo/codex-pet-load.tape       # Einstein (codex pet) — demo/codex-pet-load.{webm,gif}
 ```
 
 ---
@@ -204,4 +216,4 @@ Direct npm dependencies (auto-installed):
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](https://github.com/GainForest/pi-simocracy/blob/main/LICENSE).
