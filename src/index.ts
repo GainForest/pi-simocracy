@@ -81,7 +81,9 @@ import {
   cropRgba,
   detectPixelArtScale,
   downscaleRgbaNearest,
+  boxDownscaleRgba,
 } from "./png-to-ansi.ts";
+import { decodeWebp } from "./webp-to-rgba.ts";
 import { openRouterComplete, type ChatMessage } from "./openrouter.ts";
 import { buildSimPrompt, type LoadedSim } from "./persona.ts";
 import { runLogin, runLogout, runWhoami } from "./auth/commands.ts";
@@ -124,19 +126,43 @@ function blobLink(ref: unknown): string | null {
 }
 
 /**
- * Render a sim's sprite at its native 32×32 size as colored ANSI
- * half-block art — 16 cells tall, 32 cells wide. Compact enough to fit
- * comfortably in a terminal alongside the loaded-sim message.
+ * Maximum long-edge of a non-pixel-art avatar before we box-downscale it.
+ * Picked so codex pet idle frames render at roughly the same on-screen
+ * height as a 32×32 pipoya sprite (~17 terminal lines) instead of
+ * ballooning to 60+ lines and pushing the rest of chat off-screen.
+ */
+const NON_PIXEL_ART_TARGET_LONG_EDGE = 40;
+
+/**
+ * Render a sim's avatar as colored ANSI half-block art, sized to fit
+ * comfortably alongside the loaded-sim message in a typical terminal.
  *
- * Pulls the front-facing walk1 frame (row 0, col 0) from the 128×128
- * sprite-sheet blob. Falls back to the static avatar PNG if no sheet
- * is published for this sim.
+ * Branches on `spriteKind` (lexicon discriminator):
+ *
+ *   pipoya   — fetch the 4×4 walk-sheet PNG, crop the front-facing
+ *              walk-1 frame (32×32, row 0 col 0), render at native
+ *              resolution. ~16 lines tall.
+ *
+ *   codexPet — prefer the 8×9 atlas (`petSheet`, 1536×1872, 192×208
+ *              cells) when it's PNG: crop the idle cell (row 0 col 0)
+ *              and box-downscale to ~32 wide. The atlas is usually WebP
+ *              (the OpenAI hatch-pet skill emits WebP and `pngjs`
+ *              doesn't speak WebP), so we fall through to the rendered
+ *              `image` thumbnail — a PNG that the simocracy.org client
+ *              generates at 128×128 from the idle frame. That gets
+ *              box-downscaled to a comparable terminal size.
+ *
+ *   absent   — treated as legacy 'pipoya' for back-compat.
  */
 async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
+  const spriteKind = sim.sim.spriteKind ?? "pipoya";
   const spriteLink = blobLink(sim.sim.sprite?.ref);
+  const petSheetLink = blobLink(sim.sim.petSheet?.ref);
+  const petSheetMime = sim.sim.petSheet?.mimeType;
   const imageLink = blobLink(sim.sim.image?.ref);
 
-  if (spriteLink) {
+  // Pipoya 4×4 walk sheet — the legacy/default path.
+  if (spriteKind !== "codexPet" && spriteLink) {
     try {
       const buf = await fetchBlob(sim.did, spriteLink);
       const { width, height, data } = decodePng(buf);
@@ -158,23 +184,74 @@ async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
         alphaThreshold: 16,
       });
     } catch {
-      /* fall through to avatar */
+      /* fall through to image fallback */
     }
   }
 
+  // Codex pet atlas — the canonical asset for codex pets. Sheets are
+  // 1536×1872 with 192×208 cells laid out 8 cols × 9 rows; row 0 col 0
+  // is the idle frame. Both PNG and WebP are valid in the lexicon (the
+  // hatch-pet skill emits WebP, the dropzone preserves PNG when the
+  // user drops a PNG sheet) so we pick the right decoder by mimeType.
+  // We crop the idle cell first thing and box-downscale to ~32 wide,
+  // so the inline render is similar in height to a pipoya sprite
+  // (~17 lines).
+  if (spriteKind === "codexPet" && petSheetLink) {
+    try {
+      const buf = await fetchBlob(sim.did, petSheetLink);
+      const { width, height, data } =
+        petSheetMime === "image/webp" ? await decodeWebp(buf) : decodePng(buf);
+      const CELL_W = 192;
+      const CELL_H = 208;
+      if (width >= CELL_W && height >= CELL_H) {
+        const cell = cropRgba(data, width, height, 0, 0, CELL_W, CELL_H);
+        const targetW = 32;
+        const targetH = Math.round((CELL_H / CELL_W) * targetW); // ~35
+        const scaled = boxDownscaleRgba(cell, CELL_W, CELL_H, targetW, targetH);
+        return renderRgbaToAnsi(scaled.data, scaled.width, scaled.height, {
+          cropToContent: true,
+          cropPad: 1,
+          indent: 2,
+          alphaThreshold: 16,
+        });
+      }
+    } catch {
+      /* fall through to image fallback */
+    }
+  }
+
+  // Image fallback — used when a sim has no walk sheet (legacy pipoya
+  // sims that pre-date `org.simocracy.sim.sprite`) or when the codex
+  // pet atlas decode failed for any reason. The simocracy.org client
+  // always generates a 128×128 PNG idle thumbnail and uploads it as
+  // `image` for codex pets, so even when this path runs the right pose
+  // shows up.
   if (imageLink) {
     try {
       const buf = await fetchBlob(sim.did, imageLink);
       const { width, height, data } = decodePng(buf);
-      // Old sims (pre-sprite-sheet) only have the avatar PNG, which
-      // simocracy.org renders by 4×-upscaling a native 32×32 sprite into
-      // a 128×128 image with nearest-neighbour. Detect that and downsample
-      // back to the original size so the inline render is the same
-      // ~13-line height as a sprite-sheet-equipped sim instead of
-      // ballooning to ~22 lines and pushing chat off-screen.
+      // Old pipoya sims publish a 128×128 PNG that's a 4×-upscaled 32×32
+      // pixel-art sprite. Detect and undo that with nearest-neighbour
+      // downsampling.
       const scale = detectPixelArtScale(data, width, height, 8);
-      const native =
-        scale > 1 ? downscaleRgbaNearest(data, width, height, scale) : { data, width, height };
+      let native: { data: Buffer; width: number; height: number } =
+        scale > 1
+          ? downscaleRgbaNearest(data, width, height, scale)
+          : { data, width, height };
+      // Non-pixel-art images (codex pet thumbnails, avatars from other
+      // pipelines) come through at full resolution — box-downscale them
+      // so the ANSI render fits in a typical terminal row budget.
+      const longEdge = Math.max(native.width, native.height);
+      if (scale === 1 && longEdge > NON_PIXEL_ART_TARGET_LONG_EDGE) {
+        const k = NON_PIXEL_ART_TARGET_LONG_EDGE / longEdge;
+        native = boxDownscaleRgba(
+          native.data,
+          native.width,
+          native.height,
+          Math.max(1, Math.round(native.width * k)),
+          Math.max(1, Math.round(native.height * k)),
+        );
+      }
       return renderRgbaToAnsi(native.data, native.width, native.height, {
         cropToContent: true,
         cropPad: 1,
@@ -942,8 +1019,11 @@ async function tryLoadFromQuery(query: string): Promise<LoadedSim | null> {
       const { getRecordFromPds } = await import("./simocracy.ts");
       const sim = await getRecordFromPds<{
         name: string;
-        image?: { ref: unknown };
-        sprite?: { ref: unknown };
+        spriteKind?: "pipoya" | "codexPet";
+        image?: { ref: unknown; mimeType: string; size: number };
+        sprite?: { ref: unknown; mimeType: string; size: number };
+        petSheet?: { ref: unknown; mimeType: string; size: number };
+        petManifest?: { id?: string; displayName?: string; description?: string };
         $type?: string;
       }>(did, "org.simocracy.sim", rkey);
       const match: SimMatch = {
@@ -954,9 +1034,12 @@ async function tryLoadFromQuery(query: string): Promise<LoadedSim | null> {
         sim: {
           $type: "org.simocracy.sim",
           name: sim.name,
+          spriteKind: sim.spriteKind,
           settings: { selectedOptions: {} },
           image: sim.image as never,
           sprite: sim.sprite as never,
+          petSheet: sim.petSheet as never,
+          petManifest: sim.petManifest,
           createdAt: "",
         },
       };

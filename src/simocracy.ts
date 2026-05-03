@@ -24,13 +24,33 @@ export interface BlobRef {
   size: number;
 }
 
+/** Which sprite system a sim uses. Absent = legacy 'pipoya'. */
+export type SpriteKind = "pipoya" | "codexPet";
+
+/** Subset of pet.json from the OpenAI hatch-pet skill output. */
+export interface CodexPetManifest {
+  id?: string;
+  displayName?: string;
+  description?: string;
+}
+
 export interface SimRecord {
   $type: "org.simocracy.sim";
   name: string;
-  settings: SpriteSettings;
+  /** Discriminator for sprite system. Absent = 'pipoya'. */
+  spriteKind?: SpriteKind;
+  /** Pipoya appearance settings (only used when spriteKind = 'pipoya'). */
+  settings?: SpriteSettings;
+  /** Rendered avatar PNG/JPEG/WebP thumbnail (always present for codex pets, generated client-side as a 128×128 PNG). */
   image?: BlobRef;
+  /** Pipoya 4×4 walk sheet (128×128 PNG). Only present when spriteKind = 'pipoya'. */
   sprite?: BlobRef;
+  /** Codex pet 8×9 atlas (1536×1872, 192×208 cells, PNG or WebP). Only present when spriteKind = 'codexPet'. */
+  petSheet?: BlobRef;
+  /** Subset of pet.json from the hatch-pet skill output. Only present when spriteKind = 'codexPet'. */
+  petManifest?: CodexPetManifest;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface AgentsRecord {

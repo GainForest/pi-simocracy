@@ -43,7 +43,8 @@ here — push back to a separate extension.
 │   ├── persona.ts      # buildSimPrompt(sim) — the system-prompt fragment
 │   ├── simocracy.ts    # GraphQL indexer client + PDS client (read-only)
 │   ├── writes.ts       # PDS writers (agents + style) + auth / ownership preconditions
-│   ├── png-to-ansi.ts  # RGBA half-block ANSI renderer (pngjs-backed)
+│   ├── png-to-ansi.ts  # RGBA half-block ANSI renderer (pngjs-backed) + downscalers
+│   ├── webp-to-rgba.ts # @jsquash/webp wrapper for codex pet WebP sheets (lazy wasm init)
 │   ├── openrouter.ts   # minimal OpenRouter client (only simocracy_chat uses it)
 │   └── auth/           # ATProto loopback OAuth flow + session storage
 └── demo/
@@ -68,9 +69,11 @@ here — push back to a separate extension.
   `peerDependencies`, not `dependencies`. `.npmrc` sets
   `legacy-peer-deps=true` so npm doesn't try to drag them in during
   local installs.
-- Real npm dependencies should stay tiny. Today: just `pngjs` (PNG
-  decode) and `typebox` (tool parameter schemas). Don't add more without
-  a strong reason.
+- Real npm dependencies should stay tiny. Today: `pngjs` (PNG decode),
+  `@jsquash/webp` (WebP decode for codex pet sheets, wasm — no native
+  bindings), `typebox` (tool parameter schemas), and the two `@atproto`
+  packages used by the OAuth + write flows. Don't add more without a
+  strong reason.
 
 ---
 
@@ -138,14 +141,16 @@ in **Verifying changes** below.
 
 ## Lexicons used (read-only)
 
-All ATProto records are fetched via standard XRPC; we never write
-records from this extension. The Simocracy lexicons we read:
+ATProto records are fetched via standard XRPC. The only write surface
+is `simocracy_update_sim` (constitution + style only); the `sim`,
+`petSheet`, and `image` blobs are owned by simocracy.org's create flow.
+The Simocracy lexicons we read:
 
-| NSID                           | Records pulled                                |
-|--------------------------------|-----------------------------------------------|
-| `org.simocracy.sim`            | sprite + avatar blob refs, settings, name     |
-| `org.simocracy.agents`         | shortDescription + full constitution          |
-| `org.simocracy.style`          | speaking style / mannerisms                   |
+| NSID                           | Records pulled                                                            |
+|--------------------------------|---------------------------------------------------------------------------|
+| `org.simocracy.sim`            | name, `spriteKind`, sprite/image blob refs, codex pet `petSheet` + `petManifest` |
+| `org.simocracy.agents`         | shortDescription + full constitution                                      |
+| `org.simocracy.style`          | speaking style / mannerisms                                               |
 
 Plus blobs via `com.atproto.sync.getBlob` (with redirect-follow because
 bsky.social returns 302 to its CDN).
@@ -170,18 +175,29 @@ PDS-fallback pattern for anything user-facing.
   Respects an `alphaThreshold` so transparent regions don't print a
   background colour.
 
-Default render path (`renderSpriteAnsi` in `index.ts`):
+Default render path (`renderSpriteAnsi` in `index.ts`) branches on
+`org.simocracy.sim.spriteKind`:
 
-1. Crop the top-left 32×32 frame from the sprite-sheet blob — that's
-   the front-facing walk-1 pose. Native size, ~13 lines tall.
-2. If the sprite blob is missing, fall back to the static `image` blob
-   (Simocracy's larger thumbnail PNG, 128×128). This is *only* a fallback
-   — it's bigger and will scroll older chat off-screen on small
-   terminals. Don't promote it to default.
-
-If you ever want a strip of multiple walk frames, the sprite sheet is
-laid out as 4 columns × 4 rows of 32×32 frames, in row order
-front / left / right / back.
+1. **`pipoya`** (legacy + default when the field is absent). Crop the
+   top-left 32×32 frame from the 128×128 sprite-sheet PNG — that's the
+   front-facing walk-1 pose. Native size, ~13 lines tall. The full
+   sprite sheet is 4 columns × 4 rows of 32×32 frames, in row order
+   front / left / right / back.
+2. **`codexPet`** (OpenAI hatch-pet output). Crop the top-left 192×208
+   cell from the 1536×1872 atlas — that's the idle frame. Atlases come
+   in PNG (decoded by pngjs) or WebP (decoded by `decodeWebp` in
+   `webp-to-rgba.ts`, which lazy-inits the @jsquash/webp wasm module on
+   first use). Box-downscaled to ~32 wide so the inline render is
+   roughly the same height (~17 lines) as a pipoya sprite. Full atlas
+   layout is 8 columns × 9 rows; rows are named animation states (idle,
+   running-right, …) — see `lib/sprites/codex-pet-rows.ts` in the
+   simocracy-v2 repo for the contract.
+3. **Fallback for either kind**: the static `image` blob, a
+   client-rendered thumbnail PNG. Pi-pixel-art-upscaled images get
+   nearest-neighbour downsampled to native res; non-pixel-art images
+   (codex pet thumbnails, photos) get box-downscaled to a 40-pixel
+   long edge so the inline render stays bounded. This path is *only*
+   a fallback — it's lossier than reading the original sheet.
 
 ---
 

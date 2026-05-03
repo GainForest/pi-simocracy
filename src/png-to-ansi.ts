@@ -236,6 +236,85 @@ export function downscaleRgbaNearest(
 }
 
 /**
+ * Box-average downscale an RGBA buffer to arbitrary target dimensions.
+ *
+ * Uses straight area-weighted averaging on premultiplied alpha so partly
+ * transparent edge pixels don't bleed black into the result. Designed for
+ * non-pixel-art inputs (codex pet idle thumbnails, codex pet sheet cells)
+ * where we want a smaller display size at non-integer ratios.
+ *
+ * If the target equals the source size, returns the input untouched.
+ */
+export function boxDownscaleRgba(
+  data: Buffer,
+  width: number,
+  height: number,
+  targetW: number,
+  targetH: number,
+): { data: Buffer; width: number; height: number } {
+  if (targetW < 1 || targetH < 1) {
+    throw new Error(`boxDownscaleRgba target must be ≥1×1, got ${targetW}×${targetH}`);
+  }
+  if (targetW === width && targetH === height) {
+    return { data, width, height };
+  }
+  const out = Buffer.alloc(targetW * targetH * 4);
+  // For each output pixel, average the source rectangle that maps to it.
+  // Edge cells are clamped to the source extent.
+  for (let oy = 0; oy < targetH; oy++) {
+    const sy0 = (oy * height) / targetH;
+    const sy1 = ((oy + 1) * height) / targetH;
+    const y0 = Math.floor(sy0);
+    const y1 = Math.min(height, Math.ceil(sy1));
+    for (let ox = 0; ox < targetW; ox++) {
+      const sx0 = (ox * width) / targetW;
+      const sx1 = ((ox + 1) * width) / targetW;
+      const x0 = Math.floor(sx0);
+      const x1 = Math.min(width, Math.ceil(sx1));
+
+      // Premultiplied accumulation so transparent pixels don't smear
+      // black RGB values into mostly-opaque neighbours.
+      let rSum = 0,
+        gSum = 0,
+        bSum = 0,
+        aSum = 0,
+        wSum = 0;
+      for (let y = y0; y < y1; y++) {
+        // Vertical coverage of this source row inside the output cell.
+        const wy = Math.min(y + 1, sy1) - Math.max(y, sy0);
+        if (wy <= 0) continue;
+        for (let x = x0; x < x1; x++) {
+          const wx = Math.min(x + 1, sx1) - Math.max(x, sx0);
+          if (wx <= 0) continue;
+          const w = wx * wy;
+          const i = (y * width + x) * 4;
+          const a = data[i + 3];
+          const aw = a * w;
+          rSum += data[i] * aw;
+          gSum += data[i + 1] * aw;
+          bSum += data[i + 2] * aw;
+          aSum += aw;
+          wSum += w;
+        }
+      }
+      const di = (oy * targetW + ox) * 4;
+      if (aSum > 0) {
+        out[di] = Math.min(255, Math.round(rSum / aSum));
+        out[di + 1] = Math.min(255, Math.round(gSum / aSum));
+        out[di + 2] = Math.min(255, Math.round(bSum / aSum));
+        out[di + 3] = Math.min(255, Math.round(aSum / wSum));
+      } else {
+        out[di] = 0;
+        out[di + 1] = 0;
+        out[di + 2] = 0;
+        out[di + 3] = 0;
+      }
+    }
+  }
+  return { data: out, width: targetW, height: targetH };
+}
+
+/**
  * Detect the integer upscale factor of a pixel-art image by scanning
  * for the largest factor F where every F×F block has uniform colour.
  *

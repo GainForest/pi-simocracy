@@ -109,11 +109,18 @@ The same actions are exposed to pi as tools, so the model can drive them itself:
    - `org.simocracy.sim`     — display name + sprite + avatar blob refs
    - `org.simocracy.agents`  — short description + full constitution
    - `org.simocracy.style`   — speaking style / mannerisms
-4. **Render.** Fetch the sprite-sheet blob (128×128 PNG, 4×4 of 32×32
-   walking frames) via `com.atproto.sync.getBlob`, decode with `pngjs`,
-   crop the front-facing walk-1 frame, emit as 24-bit ANSI using the
-   upper-half-block character `▀` so each terminal cell paints two
-   pixels. Transparent regions show pi's background through.
+4. **Render.** Fetch the sprite blob via `com.atproto.sync.getBlob`,
+   decode it, crop the front-facing idle frame, and emit as 24-bit ANSI
+   using the upper-half-block character `▀` so each terminal cell paints
+   two pixels. Two render paths depending on the sim's `spriteKind`:
+   - **`pipoya`** (legacy + default): 128×128 PNG, 4×4 of 32×32 walking
+     frames; decode with `pngjs`, take row 0 col 0 at native size.
+   - **`codexPet`** (OpenAI hatch-pet output): 1536×1872 atlas, 8×9 of
+     192×208 cells. PNG sheets decode through `pngjs`; WebP sheets
+     decode through `@jsquash/webp` (wasm, lazy-init). The idle cell
+     (row 0 col 0) is box-downscaled to ~32 wide so the inline render
+     stays comparable in height to a pipoya sprite.
+   Transparent regions show pi's background through.
 5. **Inject.** A `before_agent_start` event handler appends the sim's
    identity + constitution + speaking style to pi's system prompt **every
    turn**. After `/sim unload`, a one-shot override fires on the next
@@ -133,7 +140,8 @@ src/
 ├── persona.ts      # buildSimPrompt(sim) — the system-prompt fragment
 ├── simocracy.ts    # indexer + PDS client (read-only fetchers)
 ├── writes.ts       # PDS writers + ownership / sign-in preconditions
-├── png-to-ansi.ts  # RGBA half-block ANSI renderer
+├── png-to-ansi.ts  # RGBA half-block ANSI renderer + downscalers
+├── webp-to-rgba.ts # @jsquash/webp wrapper for codex pet WebP sheets
 ├── openrouter.ts   # minimal OpenRouter client (only used by simocracy_chat)
 └── auth/           # ATProto OAuth loopback flow + session storage
 demo/
@@ -172,7 +180,11 @@ These come bundled with `pi` itself, so installing pi-simocracy via
 
 Direct npm dependencies (auto-installed):
 
-- `pngjs` — PNG decoder for sprite blobs
+- `pngjs` — PNG decoder for pipoya sprite blobs and codex pet PNG sheets
+- `@jsquash/webp` — wasm WebP decoder for codex pet WebP sheets
+  (lazy-init, no native bindings)
+- `@atproto/api` + `@atproto/oauth-client-node` — ATProto loopback OAuth
+  for `/sim login` and PDS writes via `simocracy_update_sim`
 - `typebox` — tool parameter schemas
 
 ---

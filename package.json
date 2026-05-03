@@ -45,6 +45,7 @@
   "dependencies": {
     "@atproto/api": "^0.19.11",
     "@atproto/oauth-client-node": "^0.3.17",
+    "@jsquash/webp": "^1.5.0",
     "pngjs": "^7.0.0",
     "typebox": "^1.1.24"
   },
