@@ -120,17 +120,36 @@ The same actions are exposed to pi as tools, so the model can drive them itself:
    - `org.simocracy.agents`  — short description + full constitution
    - `org.simocracy.style`   — speaking style / mannerisms
 4. **Render.** Fetch the sprite blob via `com.atproto.sync.getBlob`,
-   decode it, crop the front-facing idle frame, and emit as 24-bit ANSI
-   using the upper-half-block character `▀` so each terminal cell paints
-   two pixels. Two render paths depending on the sim's `spriteKind`:
+   decode it, crop the front-facing idle frame. Two render paths
+   depending on the sim's `spriteKind`:
    - **`pipoya`** (legacy + default): 128×128 PNG, 4×4 of 32×32 walking
      frames; decode with `pngjs`, take row 0 col 0 at native size.
    - **`codexPet`** (OpenAI hatch-pet output): 1536×1872 atlas, 8×9 of
      192×208 cells. PNG sheets decode through `pngjs`; WebP sheets
      decode through `@jsquash/webp` (wasm, lazy-init). The idle cell
-     (row 0 col 0) is box-downscaled to ~32 wide so the inline render
-     stays comparable in height to a pipoya sprite.
-   Transparent regions show pi's background through.
+     (row 0 col 0) is the source for both render paths below.
+
+   Then emit through one of two terminal output paths, picked
+   automatically per-terminal:
+   - **Inline graphics** (Kitty graphics protocol or iTerm2 inline
+     images). The cropped RGBA cell is re-encoded to PNG via `pngjs`
+     and handed to pi-tui's `Image` component, which transmits it as a
+     true-color bitmap. Used in Kitty, Ghostty, WezTerm, Konsole, and
+     iTerm2 — the terminal does its own scaling, so pixel-art sprites
+     stay crisp and codex pets render at full fidelity.
+   - **24-bit ANSI half-blocks** (universal fallback). Emits the
+     upper/lower half-block characters `▀`/`▄` with `\x1b[38;2;…m`
+     true-color escapes so each terminal cell paints two pixels. Used
+     in Apple Terminal, plain SSH, tmux without passthrough, and
+     anywhere that doesn't advertise inline-image support. Transparent
+     regions show pi's background through.
+
+   To force the half-block path even on a graphics-capable terminal
+   (handy for screenshots and demo recordings), set
+   `SIMOCRACY_INLINE_GRAPHICS=ansi`. The default is `auto`.
+
+   Both paths use the same upstream RGBA buffer — swapping between
+   them changes only the final encoding step, never the source pixels.
 5. **Inject.** A `before_agent_start` event handler appends the sim's
    identity + constitution + speaking style to pi's system prompt **every
    turn**. After `/sim unload`, a one-shot override fires on the next
@@ -151,6 +170,7 @@ src/
 ├── simocracy.ts      # indexer + PDS client (read-only fetchers)
 ├── writes.ts         # PDS writers + ownership / sign-in preconditions
 ├── png-to-ansi.ts    # RGBA half-block ANSI renderer + downscalers
+├── png-encode.ts     # RGBA → PNG encoder for inline-graphics protocols
 ├── webp-to-rgba.ts   # @jsquash/webp wrapper for codex pet WebP sheets
 ├── openrouter.ts     # minimal OpenRouter client (only used by simocracy_chat)
 └── auth/             # ATProto OAuth loopback flow + session storage

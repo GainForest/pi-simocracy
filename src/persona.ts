@@ -18,6 +18,43 @@ export interface LoadedSim {
   style?: string;
   /** Pre-rendered colored ANSI art of the sim's sprite. */
   spriteAnsi?: string;
+  /**
+   * Pre-encoded PNG of the sim's sprite (idle frame), for inline
+   * terminal graphics protocols (Kitty, iTerm2). Present when sprite
+   * rendering succeeded and the source could be encoded; the renderer
+   * uses this when the host terminal advertises image support and
+   * falls back to `spriteAnsi` otherwise.
+   */
+  spritePng?: {
+    /** base64-encoded PNG bytes (no `data:` prefix). */
+    base64: string;
+    /** Native PNG width in pixels (used for aspect ratio). */
+    widthPx: number;
+    /** Native PNG height in pixels. */
+    heightPx: number;
+  };
+  /**
+   * Pre-encoded PNG frames of the sim's idle animation, for terminals
+   * that support inline graphics. When present **and** the renderer's
+   * animation timer is active for this sim, the message renderer
+   * cycles through these instead of repeating `spritePng` — producing
+   * a gentle in-chat idle loop using the same Kitty-protocol
+   * in-place image swap that pi-tui's spinner uses to animate.
+   *
+   * Currently populated only for `codexPet` sims (their atlas defines
+   * an explicit 6-frame idle row); pipoya and image-fallback sims
+   * stay static.
+   */
+  spriteFrames?: {
+    /** base64-encoded PNG bytes per frame, in display order. */
+    pngBase64: string[];
+    /** Display rate in frames-per-second. */
+    fps: number;
+    /** Native PNG width in pixels (uniform across all frames). */
+    widthPx: number;
+    /** Native PNG height in pixels. */
+    heightPx: number;
+  };
 }
 
 /**

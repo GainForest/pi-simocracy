@@ -60,7 +60,15 @@ import type {
   ExtensionContext,
   ExtensionCommandContext,
 } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import {
+  Box,
+  Image,
+  Text,
+  allocateImageId,
+  getCapabilities,
+  type ImageTheme,
+  type TUI,
+} from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 
 import {
@@ -83,6 +91,7 @@ import {
   downscaleRgbaNearest,
   boxDownscaleRgba,
 } from "./png-to-ansi.ts";
+import { encodeRgbaToPng } from "./png-encode.ts";
 import { decodeWebp } from "./webp-to-rgba.ts";
 import { openRouterComplete, type ChatMessage } from "./openrouter.ts";
 import { buildSimPrompt, type LoadedSim } from "./persona.ts";
@@ -112,6 +121,100 @@ let loadedSim: LoadedSim | null = null;
  * previous in-character replies are still in the conversation history.
  */
 let justUnloaded: string | null = null;
+
+// ---------------------------------------------------------------------------
+// Animation state
+//
+// We animate the most recently loaded codex pet's idle row inline in chat,
+// using the same pattern pi-tui's spinner uses: a setInterval ticks a frame
+// counter and calls `tui.requestRender()`, which makes pi-tui re-run the
+// message renderer. Each render returns a new `Image` keyed by a stable
+// Kitty image ID, so the terminal swaps the displayed frame in place.
+//
+// Typing keeps working during animation — input handling and rendering are
+// independent code paths in pi-tui (verified by inspection of `Loader`).
+//
+// Only ONE sim animates at a time. When a new sim is loaded, the previous
+// timer stops and the previous message freezes on its idle frame.
+// ---------------------------------------------------------------------------
+
+/** Captured pi-tui handle. Set by the `simocracy` widget factory the first
+ *  time a sim is loaded; reused for every subsequent animation tick. Lazy
+ *  because the TUI doesn't exist when the extension first imports. */
+let capturedTui: TUI | null = null;
+
+interface ActiveAnimation {
+  /** Identifies which loaded-sim message owns this animation. The renderer
+   *  compares against `details.animationKey` to decide whether to use the
+   *  current frame or the static idle PNG. */
+  key: string;
+  /** Stable Kitty image ID so frame transmissions replace the previous one
+   *  instead of stacking. Allocated once per sim load. */
+  imageId: number;
+  /** Pre-encoded base64 PNGs in playback order. */
+  frames: string[];
+  /** Frame width / height in pixels (uniform across frames). */
+  widthPx: number;
+  heightPx: number;
+  /** Currently displayed frame index. */
+  currentFrame: number;
+  /** Active setInterval handle so we can clear it on unload / reload. */
+  intervalId: ReturnType<typeof setInterval> | null;
+}
+let currentAnimation: ActiveAnimation | null = null;
+
+/** Default-on; set `SIMOCRACY_ANIMATION=off` to freeze on idle frame 0. */
+const animationEnabled =
+  (process.env.SIMOCRACY_ANIMATION ?? "on").toLowerCase() !== "off";
+
+/**
+ * Width of the inline sprite render in terminal cells. The source PNG
+ * is always transmitted at native resolution (192×208 for codex pets,
+ * 32×32 for pipoya — see `renderSprite`); this number controls only
+ * how many cells the terminal uses to display it. Aspect ratio is
+ * preserved by pi-tui's `calculateImageRows`. Override with the
+ * `SIMOCRACY_SPRITE_WIDTH` env var.
+ *
+ * 10 cells wide gives a compact ≈6-row inline render that sits
+ * comfortably alongside one or two paragraphs of bio text without
+ * dominating the chat. Bump it to 20 or 32 if you want the sprite
+ * to read at a glance.
+ */
+const spriteWidthCells = (() => {
+  const raw = process.env.SIMOCRACY_SPRITE_WIDTH;
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+  return Number.isFinite(parsed) && parsed >= 4 && parsed <= 120 ? parsed : 10;
+})();
+
+function stopCurrentAnimation(): void {
+  if (currentAnimation?.intervalId !== null && currentAnimation?.intervalId !== undefined) {
+    clearInterval(currentAnimation.intervalId);
+  }
+  currentAnimation = null;
+}
+
+function startAnimationFor(key: string, frames: { pngBase64: string[]; fps: number; widthPx: number; heightPx: number }): void {
+  // Always replace any prior animation — only the most recent loaded-sim
+  // message animates.
+  stopCurrentAnimation();
+  if (!animationEnabled || frames.pngBase64.length < 2) return;
+  currentAnimation = {
+    key,
+    imageId: allocateImageId(),
+    frames: frames.pngBase64,
+    widthPx: frames.widthPx,
+    heightPx: frames.heightPx,
+    currentFrame: 0,
+    intervalId: null,
+  };
+  const intervalMs = Math.max(1000 / frames.fps, 60); // clamp to ≆16 fps max
+  currentAnimation.intervalId = setInterval(() => {
+    if (!currentAnimation) return;
+    currentAnimation.currentFrame =
+      (currentAnimation.currentFrame + 1) % currentAnimation.frames.length;
+    capturedTui?.requestRender();
+  }, intervalMs);
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -153,13 +256,74 @@ const NON_PIXEL_ART_TARGET_LONG_EDGE = 40;
  *              box-downscaled to a comparable terminal size.
  *
  *   absent   — treated as legacy 'pipoya' for back-compat.
+ *
+ * Returns BOTH the ANSI half-block render (always — it's our universal
+ * fallback) AND, when possible, a PNG of the same RGBA cell for inline
+ * terminal-graphics protocols (Kitty / iTerm2). The renderer chooses
+ * which to display based on the host terminal's capabilities.
+ *
+ * The PNG is encoded at the *native* resolution we cropped to (32×32
+ * for pipoya, 192×208 for codexPet, the post-downscale size for the
+ * image fallback). Kitty / iTerm2 do their own scaling to the target
+ * cell box, so passing the native pixels gives the terminal the most
+ * information to work with — pixel art scales up crisply with
+ * nearest-neighbour, codex pet thumbnails scale down cleanly.
  */
-async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
+export interface SpriteRender {
+  ansi: string;
+  png?: { data: Buffer; widthPx: number; heightPx: number };
+  /**
+   * Optional animation frames. Each entry in `pngs` is a PNG of one
+   * cell. Set for codex pets (idle row of their atlas); absent for
+   * everything else (pipoya sprites and image fallbacks render as a
+   * single static frame). The renderer plays these in a loop using
+   * the Kitty in-place image-swap protocol when animation is enabled.
+   */
+  frames?: { pngs: Buffer[]; widthPx: number; heightPx: number; fps: number };
+}
+
+/**
+ * Codex pet atlas constants — keep in sync with the simocracy-v2 hatch-pet
+ * skill that produces these sheets. The atlas is 8 cols × 9 rows of
+ * 192×208 cells; the idle animation lives on row 0, frames 0–5 (the same
+ * default tui-pets ships when a pet.json doesn't override it).
+ */
+const CODEX_PET_CELL_W = 192;
+const CODEX_PET_CELL_H = 208;
+const CODEX_PET_COLS = 8;
+const CODEX_PET_IDLE_FRAMES = [0, 1, 2, 3, 4, 5];
+const CODEX_PET_IDLE_FPS = 5;
+
+async function renderSprite(sim: SimMatch): Promise<SpriteRender | null> {
   const spriteKind = sim.sim.spriteKind ?? "pipoya";
   const spriteLink = blobLink(sim.sim.sprite?.ref);
   const petSheetLink = blobLink(sim.sim.petSheet?.ref);
   const petSheetMime = sim.sim.petSheet?.mimeType;
   const imageLink = blobLink(sim.sim.image?.ref);
+
+  /** Render an RGBA region to ANSI half-blocks (shared options). */
+  const toAnsi = (data: Buffer, width: number, height: number) =>
+    renderRgbaToAnsi(data, width, height, {
+      cropToContent: true,
+      cropPad: 1,
+      indent: 2,
+      alphaThreshold: 16,
+    });
+
+  /** Bundle ANSI + PNG of the same RGBA region. PNG-encode is a tiny
+   *  cost and is wrapped in try/catch — if encoding ever fails we
+   *  still return the ANSI render (lossless fallback). */
+  const bundle = (data: Buffer, width: number, height: number): SpriteRender => {
+    const ansi = toAnsi(data, width, height);
+    let png: SpriteRender["png"];
+    try {
+      const pngBytes = encodeRgbaToPng(data, width, height);
+      png = { data: pngBytes, widthPx: width, heightPx: height };
+    } catch {
+      png = undefined;
+    }
+    return { ansi, png };
+  };
 
   // Pipoya 4×4 walk sheet — the legacy/default path.
   if (spriteKind !== "codexPet" && spriteLink) {
@@ -170,19 +334,9 @@ async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
       if (width >= FRAME && height >= FRAME) {
         // Sheets are 4×4 of 32×32 frames — row 0 col 0 = front-facing walk1.
         const frame = cropRgba(data, width, height, 0, 0, FRAME, FRAME);
-        return renderRgbaToAnsi(frame, FRAME, FRAME, {
-          cropToContent: true,
-          cropPad: 1,
-          indent: 2,
-          alphaThreshold: 16,
-        });
+        return bundle(frame, FRAME, FRAME);
       }
-      return renderRgbaToAnsi(data, width, height, {
-        cropToContent: true,
-        cropPad: 1,
-        indent: 2,
-        alphaThreshold: 16,
-      });
+      return bundle(data, width, height);
     } catch {
       /* fall through to image fallback */
     }
@@ -193,9 +347,12 @@ async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
   // is the idle frame. Both PNG and WebP are valid in the lexicon (the
   // hatch-pet skill emits WebP, the dropzone preserves PNG when the
   // user drops a PNG sheet) so we pick the right decoder by mimeType.
-  // We crop the idle cell first thing and box-downscale to ~32 wide,
-  // so the inline render is similar in height to a pipoya sprite
-  // (~17 lines).
+  // We crop the idle cell first thing. For the ANSI render we
+  // box-downscale to ~32 wide so the inline render is similar in
+  // height to a pipoya sprite (~17 lines). For the inline-graphics
+  // PNG we keep the native 192×208 resolution — Kitty / iTerm2 will
+  // scale it down at display time, which preserves more detail than
+  // pre-downscaling here.
   if (spriteKind === "codexPet" && petSheetLink) {
     try {
       const buf = await fetchBlob(sim.did, petSheetLink);
@@ -208,12 +365,46 @@ async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
         const targetW = 32;
         const targetH = Math.round((CELL_H / CELL_W) * targetW); // ~35
         const scaled = boxDownscaleRgba(cell, CELL_W, CELL_H, targetW, targetH);
-        return renderRgbaToAnsi(scaled.data, scaled.width, scaled.height, {
-          cropToContent: true,
-          cropPad: 1,
-          indent: 2,
-          alphaThreshold: 16,
-        });
+        const ansi = toAnsi(scaled.data, scaled.width, scaled.height);
+        let png: SpriteRender["png"];
+        try {
+          const pngBytes = encodeRgbaToPng(cell, CELL_W, CELL_H);
+          png = { data: pngBytes, widthPx: CELL_W, heightPx: CELL_H };
+        } catch {
+          png = undefined;
+        }
+
+        // Idle animation frames — same atlas, different cell offsets.
+        // Encoded eagerly here so the message renderer can flip
+        // between them at ~5 FPS without re-decoding the WebP. Wrapped
+        // in its own try/catch — a frame-encoding failure shouldn't
+        // disable the static render.
+        let frames: SpriteRender["frames"];
+        try {
+          const framePngs: Buffer[] = [];
+          for (const idx of CODEX_PET_IDLE_FRAMES) {
+            const cx = (idx % CODEX_PET_COLS) * CELL_W;
+            const cy = Math.floor(idx / CODEX_PET_COLS) * CELL_H;
+            // Skip frames that fall outside the actual atlas extent.
+            if (cx + CELL_W > width || cy + CELL_H > height) continue;
+            const frameCell = cropRgba(data, width, height, cx, cy, CELL_W, CELL_H);
+            framePngs.push(encodeRgbaToPng(frameCell, CELL_W, CELL_H));
+          }
+          // Single-frame "animations" are pointless — leave `frames`
+          // unset so the renderer takes the static path. Two or more
+          // = a real loop.
+          if (framePngs.length >= 2) {
+            frames = {
+              pngs: framePngs,
+              widthPx: CELL_W,
+              heightPx: CELL_H,
+              fps: CODEX_PET_IDLE_FPS,
+            };
+          }
+        } catch {
+          frames = undefined;
+        }
+        return { ansi, png, frames };
       }
     } catch {
       /* fall through to image fallback */
@@ -252,12 +443,7 @@ async function renderSpriteAnsi(sim: SimMatch): Promise<string | null> {
           Math.max(1, Math.round(native.height * k)),
         );
       }
-      return renderRgbaToAnsi(native.data, native.width, native.height, {
-        cropToContent: true,
-        cropPad: 1,
-        indent: 2,
-        alphaThreshold: 16,
-      });
+      return bundle(native.data, native.width, native.height);
     } catch {
       /* fall through */
     }
@@ -284,10 +470,10 @@ async function loadSimByName(query: string): Promise<{
 
 async function hydrateLoadedSim(match: SimMatch): Promise<LoadedSim> {
   // Fetch agents (constitution), style, sprite ANSI + handle in parallel.
-  const [agents, style, spriteAnsi, handle] = await Promise.all([
+  const [agents, style, sprite, handle] = await Promise.all([
     fetchAgentsForSim(match.uri).catch(() => null) as Promise<AgentsRecord | null>,
     fetchStyleForSim(match.uri).catch(() => null) as Promise<StyleRecord | null>,
-    renderSpriteAnsi(match).catch(() => null),
+    renderSprite(match).catch(() => null),
     resolveHandle(match.did).catch(() => null),
   ]);
 
@@ -297,14 +483,36 @@ async function hydrateLoadedSim(match: SimMatch): Promise<LoadedSim> {
     rkey: match.rkey,
     name: match.sim.name,
     handle,
-    spriteAnsi: spriteAnsi ?? undefined,
+    spriteAnsi: sprite?.ansi,
+    spritePng: sprite?.png
+      ? {
+          base64: sprite.png.data.toString("base64"),
+          widthPx: sprite.png.widthPx,
+          heightPx: sprite.png.heightPx,
+        }
+      : undefined,
+    spriteFrames: sprite?.frames
+      ? {
+          pngBase64: sprite.frames.pngs.map((b) => b.toString("base64")),
+          fps: sprite.frames.fps,
+          widthPx: sprite.frames.widthPx,
+          heightPx: sprite.frames.heightPx,
+        }
+      : undefined,
     shortDescription: agents?.shortDescription,
     description: agents?.description,
     style: style?.description,
   };
 }
 
-function formatSimSummary(
+/**
+ * Build the bio text block that appears alongside (or below) the
+ * sprite in the loaded-sim message: name + handle + AT-URI +
+ * shortDescription. Indented two spaces so it lines up with the ANSI
+ * sprite render. Used both as a standalone block (Image+Text
+ * variant) and as the trailing portion of `formatSimSummary`.
+ */
+function formatSimBio(
   sim: LoadedSim,
   theme?: ExtensionContext["ui"]["theme"],
 ): string {
@@ -313,16 +521,25 @@ function formatSimSummary(
     ? (s: string) => theme.fg("accent", s)
     : (s: string) => s;
   const lines: string[] = [];
-  if (sim.spriteAnsi) {
-    lines.push(sim.spriteAnsi);
-    lines.push("");
-  }
   lines.push(`  🐾 ${accent(sim.name)}${sim.handle ? dim(`  @${sim.handle}`) : ""} loaded—pi is now in character.`);
   lines.push(dim(`  ${sim.uri}`));
   if (sim.shortDescription) {
     lines.push("");
     lines.push("  " + sim.shortDescription.split("\n").join("\n  "));
   }
+  return lines.join("\n");
+}
+
+function formatSimSummary(
+  sim: LoadedSim,
+  theme?: ExtensionContext["ui"]["theme"],
+): string {
+  const lines: string[] = [];
+  if (sim.spriteAnsi) {
+    lines.push(sim.spriteAnsi);
+    lines.push("");
+  }
+  lines.push(formatSimBio(sim, theme));
   return lines.join("\n");
 }
 
@@ -411,11 +628,90 @@ export default async function simocracy(pi: ExtensionAPI) {
 
   // -------------------------------------------------------------------------
   // Custom message renderer — shows the sprite + bio inline in the chat.
+  //
+  // Two render paths, picked per-call:
+  //
+  //   1. Inline graphics (preferred when supported). Terminals that
+  //      advertise the Kitty graphics protocol (Kitty, Ghostty, WezTerm,
+  //      Konsole) or iTerm2's inline-image protocol get a real PNG of
+  //      the sprite via pi-tui's `Image` component, stacked above the
+  //      bio text in a `Box`. Pixels are crisp, scaling is the
+  //      terminal's job.
+  //
+  //   2. ANSI half-blocks (universal fallback). Everything else —
+  //      Apple Terminal, tmux without passthrough, plain SSH, dumb
+  //      pipes — falls back to the existing `▀`/`▄` half-block art.
+  //
+  // Override with `SIMOCRACY_INLINE_GRAPHICS=ansi` to force the
+  // half-block path even when the terminal supports inline graphics
+  // (handy for screenshots, demo recordings, or terminals that
+  // *advertise* support but render glitchily).
   // -------------------------------------------------------------------------
-  pi.registerMessageRenderer<{ body: string }>("simocracy_sim_loaded", (message) => {
+  const inlineGraphicsMode =
+    (process.env.SIMOCRACY_INLINE_GRAPHICS ?? "auto").toLowerCase();
+  pi.registerMessageRenderer<SimLoadedDetails>("simocracy_sim_loaded", (message, _opts, theme) => {
+    const details = (message.details as SimLoadedDetails | undefined) ?? {};
     const body =
-      (message.details as { body?: string } | undefined)?.body ??
-      (typeof message.content === "string" ? message.content : "");
+      details.body ?? (typeof message.content === "string" ? message.content : "");
+
+    // Decide whether to use the inline-graphics path. Auto-detect by
+    // default; honour the env-var override either direction.
+    const caps = getCapabilities();
+    const wantGraphics =
+      inlineGraphicsMode === "auto"
+        ? caps.images !== null
+        : inlineGraphicsMode === "kitty" || inlineGraphicsMode === "iterm2";
+    if (wantGraphics && details.spritePngBase64 && details.bioText) {
+      // Pi-tui's Image needs a fallback colour for terminals that
+      // claim image support but later fail to render — we use the
+      // theme's `dim` so the placeholder text is unobtrusive.
+      const imageTheme: ImageTheme = {
+        fallbackColor: theme.fg("dim", "") ? (s: string) => theme.fg("dim", s) : (s: string) => s,
+      };
+      // Animation handoff: if there's an active animation AND it's
+      // for this exact message (matching animationKey), pull the
+      // current frame's PNG + the stable Kitty image ID. The image
+      // ID makes successive frame transmissions replace each other
+      // in place rather than stacking. For everything else (older
+      // loaded-sim messages, sims without animation frames) we use
+      // the static idle PNG with no image ID, so they freeze
+      // gracefully on the first frame.
+      let pngBase64 = details.spritePngBase64;
+      let imageOptions: { maxWidthCells: number; imageId?: number } = {
+        maxWidthCells: spriteWidthCells,
+      };
+      let imageDims = {
+        widthPx: details.spritePngWidth ?? 0,
+        heightPx: details.spritePngHeight ?? 0,
+      };
+      if (
+        currentAnimation &&
+        details.animationKey &&
+        currentAnimation.key === details.animationKey
+      ) {
+        pngBase64 = currentAnimation.frames[currentAnimation.currentFrame] ?? pngBase64;
+        imageOptions = {
+          maxWidthCells: spriteWidthCells,
+          imageId: currentAnimation.imageId,
+        };
+        imageDims = { widthPx: currentAnimation.widthPx, heightPx: currentAnimation.heightPx };
+      }
+      // Source PNG is at full native resolution (192×208 for codex
+      // pets, 32×32 for pipoya). The terminal scales it down to
+      // `spriteWidthCells` cells wide on display — we never
+      // pre-downsample on our side, so quality is preserved.
+      const image = new Image(
+        pngBase64,
+        "image/png",
+        imageTheme,
+        imageOptions,
+        imageDims,
+      );
+      const box = new Box(0, 0);
+      box.addChild(image);
+      box.addChild(new Text(details.bioText, 0, 0));
+      return box;
+    }
     return new Text(body, 0, 0);
   });
 
@@ -488,6 +784,7 @@ export default async function simocracy(pi: ExtensionAPI) {
         const name = loadedSim.name;
         loadedSim = null;
         justUnloaded = name;
+        stopCurrentAnimation();
         ctx.ui.setStatus("simocracy", undefined);
         ctx.ui.setWidget("simocracy", undefined);
         ctx.ui.notify(`Unloaded ${name}. Pi will break character on the next reply.`, "info");
@@ -577,6 +874,7 @@ export default async function simocracy(pi: ExtensionAPI) {
       const name = loadedSim.name;
       loadedSim = null;
       justUnloaded = name;
+      stopCurrentAnimation();
       if (ctx.hasUI) {
         ctx.ui.setStatus("simocracy", undefined);
         ctx.ui.setWidget("simocracy", undefined);
@@ -1053,6 +1351,41 @@ async function tryLoadFromQuery(query: string): Promise<LoadedSim | null> {
   return await hydrateLoadedSim(result.matches[0]);
 }
 
+/**
+ * Shape of `details` on the `simocracy_sim_loaded` custom message.
+ * The renderer reads this to choose between the inline-graphics and
+ * ANSI-half-block render paths; both fields are best-effort — the
+ * renderer falls back to the combined `body` string if anything is
+ * missing.
+ */
+interface SimLoadedDetails {
+  uri?: string;
+  did?: string;
+  rkey?: string;
+  name?: string;
+  /** Combined ANSI sprite + bio, used by the half-block fallback path
+   *  and as the textual log content. */
+  body?: string;
+  /** Bio text only (no sprite), used alongside the Image component
+   *  on the inline-graphics path. */
+  bioText?: string;
+  /** base64-encoded PNG of the sprite cell. Triggers the inline-graphics
+   *  path when set + the terminal advertises image support. */
+  spritePngBase64?: string;
+  /** Native PNG width in pixels (aspect ratio for Image scaling). */
+  spritePngWidth?: number;
+  /** Native PNG height in pixels. */
+  spritePngHeight?: number;
+  /**
+   * Identity tag for the active animation, if any. The message renderer
+   * compares against `currentAnimation.key` to decide whether to swap
+   * in the current animation frame or freeze on the static idle PNG.
+   * Stable across re-renders of the same message; differs across
+   * separate sim loads.
+   */
+  animationKey?: string;
+}
+
 async function postSimToChat(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -1060,21 +1393,54 @@ async function postSimToChat(
   _reload: boolean,
 ) {
   ctx.ui.setStatus("simocracy", `🐾 ${sim.name}`);
-  const headerLines = [`Simocracy: ${sim.name}${sim.handle ? `  (@${sim.handle})` : ""}`];
-  ctx.ui.setWidget("simocracy", headerLines, { placement: "aboveEditor" });
+  // Use the factory form of setWidget so we can capture pi-tui's TUI
+  // handle. We need it to call `requestRender()` from the animation
+  // setInterval (the message renderer doesn't get a TUI reference).
+  // The factory itself returns a tiny static Text widget — the TUI
+  // capture is the actual purpose.
+  const headerText = `Simocracy: ${sim.name}${sim.handle ? `  (@${sim.handle})` : ""}`;
+  ctx.ui.setWidget(
+    "simocracy",
+    (tui) => {
+      capturedTui = tui;
+      return new Text(headerText, 0, 0);
+    },
+    { placement: "aboveEditor" },
+  );
   const body = formatSimSummary(sim, ctx.ui.theme);
+  const bioText = formatSimBio(sim, ctx.ui.theme);
+  // Unique key per load so the renderer can tell which message owns
+  // the active animation. AT-URI + timestamp protects against
+  // re-loading the same sim twice (each load starts its own loop).
+  const animationKey = `${sim.uri}#${Date.now()}`;
+  const details: SimLoadedDetails = {
+    uri: sim.uri,
+    did: sim.did,
+    rkey: sim.rkey,
+    name: sim.name,
+    body,
+    bioText,
+    animationKey,
+  };
+  if (sim.spritePng) {
+    details.spritePngBase64 = sim.spritePng.base64;
+    details.spritePngWidth = sim.spritePng.widthPx;
+    details.spritePngHeight = sim.spritePng.heightPx;
+  }
   pi.sendMessage({
     customType: "simocracy_sim_loaded",
     content: stripAnsiForLog(body),
     display: true,
-    details: {
-      uri: sim.uri,
-      did: sim.did,
-      rkey: sim.rkey,
-      name: sim.name,
-      body,
-    },
+    details,
   });
+  // Kick off (or replace) the animation loop. Only one loop runs at a
+  // time — the last loaded sim animates, earlier messages freeze on
+  // their idle frame.
+  if (sim.spriteFrames) {
+    startAnimationFor(animationKey, sim.spriteFrames);
+  } else {
+    stopCurrentAnimation();
+  }
 }
 
 /** Strip ANSI escapes for the textual log copy (the renderer uses details.body). */

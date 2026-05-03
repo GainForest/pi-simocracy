@@ -44,6 +44,7 @@ here — push back to a separate extension.
 │   ├── simocracy.ts    # GraphQL indexer client + PDS client (read-only)
 │   ├── writes.ts       # PDS writers (agents + style) + auth / ownership preconditions
 │   ├── png-to-ansi.ts  # RGBA half-block ANSI renderer (pngjs-backed) + downscalers
+│   ├── png-encode.ts   # RGBA → PNG encoder for inline-graphics protocols (Kitty/iTerm2)
 │   ├── webp-to-rgba.ts # @jsquash/webp wrapper for codex pet WebP sheets (lazy wasm init)
 │   ├── openrouter.ts   # minimal OpenRouter client (only simocracy_chat uses it)
 │   └── auth/           # ATProto loopback OAuth flow + session storage
@@ -168,6 +169,28 @@ PDS-fallback pattern for anything user-facing.
 
 ## Sprite rendering
 
+Two terminal output paths are picked per-render in the
+`simocracy_sim_loaded` message renderer (`src/index.ts`):
+
+1. **Inline graphics** (preferred). When pi-tui's `getCapabilities()`
+   returns `images: "kitty" | "iterm2"` (Kitty, Ghostty, WezTerm,
+   Konsole, iTerm2), the cropped RGBA cell is PNG-encoded via
+   `src/png-encode.ts` and handed to pi-tui's `Image` component. That
+   emits the Kitty graphics protocol (`\x1b_Ga=T,f=100;<base64>\x1b\\`)
+   or iTerm2 inline-image escape (`\x1b]1337;File=...:<base64>\x07`),
+   sized to ~32 cells wide so the on-screen height matches the ANSI
+   render. The terminal handles scaling — pixel art stays crisp,
+   codex pets render at native fidelity.
+2. **ANSI half-blocks** (universal fallback). When the terminal
+   doesn't advertise inline-image support, or when the user sets
+   `SIMOCRACY_INLINE_GRAPHICS=ansi`, we emit the existing
+   `▀`/`▄` half-block render with 24-bit color escapes.
+
+Both paths consume the **same** upstream RGBA buffer produced by
+`renderSprite()` — the function returns `{ ansi, png }` and the
+renderer picks one. If you change cropping or downscaling, both
+output paths get the change for free.
+
 `src/png-to-ansi.ts` is a small standalone module:
 
 - `decodePng(buf)` — pngjs wrapper, always returns 8-bit RGBA.
@@ -179,7 +202,7 @@ PDS-fallback pattern for anything user-facing.
   Respects an `alphaThreshold` so transparent regions don't print a
   background colour.
 
-Default render path (`renderSpriteAnsi` in `index.ts`) branches on
+Default render path (`renderSprite` in `index.ts`) branches on
 `org.simocracy.sim.spriteKind`:
 
 1. **`pipoya`** (legacy + default when the field is absent). Crop the
