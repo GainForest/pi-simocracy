@@ -1,6 +1,6 @@
 {
   "name": "pi-simocracy",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Pi extension: load a Simocracy sim into your chat — see its pixel-art sprite render inline in the terminal and roleplay with it.",
   "type": "module",
   "author": "David Dao <david@gainforest.earth> (https://github.com/daviddao)",
