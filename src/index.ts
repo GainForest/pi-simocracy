@@ -69,6 +69,7 @@ import {
   type ImageTheme,
   type TUI,
 } from "@mariozechner/pi-tui";
+import { AnimatedImage } from "./animated-image.ts";
 import { Type } from "typebox";
 
 import {
@@ -144,9 +145,10 @@ let justUnloaded: string | null = null;
 let capturedTui: TUI | null = null;
 
 interface ActiveAnimation {
-  /** Identifies which loaded-sim message owns this animation. The renderer
-   *  compares against `details.animationKey` to decide whether to use the
-   *  current frame or the static idle PNG. */
+  /** Identifies which loaded-sim message owns this animation. The
+   *  renderer compares against `details.animationKey` to decide
+   *  whether to mount the live `AnimatedImage` for this message or a
+   *  static idle frame. */
   key: string;
   /** Stable Kitty image ID so frame transmissions replace the previous one
    *  instead of stacking. Allocated once per sim load. */
@@ -156,10 +158,17 @@ interface ActiveAnimation {
   /** Frame width / height in pixels (uniform across frames). */
   widthPx: number;
   heightPx: number;
-  /** Currently displayed frame index. */
-  currentFrame: number;
-  /** Active setInterval handle so we can clear it on unload / reload. */
-  intervalId: ReturnType<typeof setInterval> | null;
+  /** Display rate. */
+  fps: number;
+  /**
+   * The live animated component. Created lazily inside the message
+   * renderer the first time it's asked for this `key` — we need a
+   * TUI handle to construct one, and the renderer is the natural
+   * place that has access (via `capturedTui`). Disposed when a new
+   * sim takes over the active-animation slot or when the sim is
+   * unloaded.
+   */
+  component: AnimatedImage | null;
 }
 let currentAnimation: ActiveAnimation | null = null;
 
@@ -187,15 +196,18 @@ const spriteWidthCells = (() => {
 })();
 
 function stopCurrentAnimation(): void {
-  if (currentAnimation?.intervalId !== null && currentAnimation?.intervalId !== undefined) {
-    clearInterval(currentAnimation.intervalId);
+  if (currentAnimation?.component) {
+    currentAnimation.component.dispose();
   }
   currentAnimation = null;
 }
 
-function startAnimationFor(key: string, frames: { pngBase64: string[]; fps: number; widthPx: number; heightPx: number }): void {
-  // Always replace any prior animation — only the most recent loaded-sim
-  // message animates.
+function startAnimationFor(
+  key: string,
+  frames: { pngBase64: string[]; fps: number; widthPx: number; heightPx: number },
+): void {
+  // Always replace any prior animation — only the most recent
+  // loaded-sim message animates.
   stopCurrentAnimation();
   if (!animationEnabled || frames.pngBase64.length < 2) return;
   currentAnimation = {
@@ -204,16 +216,12 @@ function startAnimationFor(key: string, frames: { pngBase64: string[]; fps: numb
     frames: frames.pngBase64,
     widthPx: frames.widthPx,
     heightPx: frames.heightPx,
-    currentFrame: 0,
-    intervalId: null,
+    fps: frames.fps,
+    // Lazily instantiated by the message renderer the first time it
+    // sees this `key` — we don't have a TUI handle here, only inside
+    // the setWidget factory.
+    component: null,
   };
-  const intervalMs = Math.max(1000 / frames.fps, 60); // clamp to ≆16 fps max
-  currentAnimation.intervalId = setInterval(() => {
-    if (!currentAnimation) return;
-    currentAnimation.currentFrame =
-      (currentAnimation.currentFrame + 1) % currentAnimation.frames.length;
-    capturedTui?.requestRender();
-  }, intervalMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -668,47 +676,57 @@ export default async function simocracy(pi: ExtensionAPI) {
       const imageTheme: ImageTheme = {
         fallbackColor: theme.fg("dim", "") ? (s: string) => theme.fg("dim", s) : (s: string) => s,
       };
-      // Animation handoff: if there's an active animation AND it's
-      // for this exact message (matching animationKey), pull the
-      // current frame's PNG + the stable Kitty image ID. The image
-      // ID makes successive frame transmissions replace each other
-      // in place rather than stacking. For everything else (older
-      // loaded-sim messages, sims without animation frames) we use
-      // the static idle PNG with no image ID, so they freeze
-      // gracefully on the first frame.
-      let pngBase64 = details.spritePngBase64;
-      let imageOptions: { maxWidthCells: number; imageId?: number } = {
-        maxWidthCells: spriteWidthCells,
-      };
-      let imageDims = {
-        widthPx: details.spritePngWidth ?? 0,
-        heightPx: details.spritePngHeight ?? 0,
-      };
-      if (
-        currentAnimation &&
-        details.animationKey &&
-        currentAnimation.key === details.animationKey
-      ) {
-        pngBase64 = currentAnimation.frames[currentAnimation.currentFrame] ?? pngBase64;
-        imageOptions = {
-          maxWidthCells: spriteWidthCells,
-          imageId: currentAnimation.imageId,
-        };
-        imageDims = { widthPx: currentAnimation.widthPx, heightPx: currentAnimation.heightPx };
-      }
-      // Source PNG is at full native resolution (192×208 for codex
-      // pets, 32×32 for pipoya). The terminal scales it down to
-      // `spriteWidthCells` cells wide on display — we never
-      // pre-downsample on our side, so quality is preserved.
-      const image = new Image(
-        pngBase64,
-        "image/png",
-        imageTheme,
-        imageOptions,
-        imageDims,
-      );
       const box = new Box(0, 0);
-      box.addChild(image);
+
+      // If this message owns the active animation slot, mount a live
+      // `AnimatedImage` (cycles frames, owns its own setInterval). We
+      // cache the component on `currentAnimation.component` so we
+      // don't spawn a fresh timer on every re-render of the message
+      // (pi-tui calls the renderer again on expand/collapse, theme
+      // change, etc.).
+      //
+      // For every other case — older loaded-sim messages whose key
+      // doesn't match, sims without animation frames, or animation
+      // disabled via env — we mount a static `Image` of the idle
+      // frame, which freezes gracefully.
+      const isActiveAnimation =
+        currentAnimation &&
+        capturedTui !== null &&
+        details.animationKey !== undefined &&
+        currentAnimation.key === details.animationKey;
+      if (isActiveAnimation) {
+        if (!currentAnimation!.component) {
+          currentAnimation!.component = new AnimatedImage({
+            frames: currentAnimation!.frames,
+            dimensions: {
+              widthPx: currentAnimation!.widthPx,
+              heightPx: currentAnimation!.heightPx,
+            },
+            maxWidthCells: spriteWidthCells,
+            imageId: currentAnimation!.imageId,
+            fps: currentAnimation!.fps,
+            tui: capturedTui!,
+          });
+        }
+        box.addChild(currentAnimation!.component);
+      } else {
+        // Source PNG is at full native resolution (192×208 for codex
+        // pets, 32×32 for pipoya). The terminal scales it down to
+        // `spriteWidthCells` cells wide on display — we never
+        // pre-downsample on our side, so quality is preserved.
+        box.addChild(
+          new Image(
+            details.spritePngBase64,
+            "image/png",
+            imageTheme,
+            { maxWidthCells: spriteWidthCells },
+            {
+              widthPx: details.spritePngWidth ?? 0,
+              heightPx: details.spritePngHeight ?? 0,
+            },
+          ),
+        );
+      }
       box.addChild(new Text(details.bioText, 0, 0));
       return box;
     }
