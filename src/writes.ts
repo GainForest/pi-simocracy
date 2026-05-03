@@ -127,6 +127,8 @@ export async function getAuthenticatedAgent(): Promise<{ agent: Agent; did: stri
 
 const COLLECTION_AGENTS = "org.simocracy.agents";
 const COLLECTION_STYLE = "org.simocracy.style";
+const COLLECTION_COMMENT = "org.impactindexer.review.comment";
+const COLLECTION_HISTORY = "org.simocracy.history";
 
 /**
  * Defense-in-depth: every write helper below verifies the target
@@ -274,6 +276,118 @@ export async function updateStyle(opts: {
     record,
   });
   return { uri: res.data.uri, cid: res.data.cid };
+}
+
+/**
+ * POST `org.impactindexer.review.comment`.
+ *
+ * Matches the wire shape simocracy.org's `useRecordComments.postComment`
+ * already writes today (`subject = { uri, type: 'record' }`, no CID), so
+ * comments authored from pi render identically in the webapp and thread
+ * correctly under the same parent. The `subject.uri` is the parent
+ * record — proposal, gathering, sim, decision, or another comment for
+ * a nested reply.
+ *
+ * No sim-attribution lives in this record. Sim attribution is a
+ * sidecar `org.simocracy.history` written by `createCommentHistory`
+ * below — see `docs/SIM_AUTHORED_COMMENTS.md` for the full design.
+ */
+export async function createComment(opts: {
+  agent: Agent;
+  did: string;
+  subjectUri: string;
+  text: string;
+}): Promise<{ uri: string; cid: string; rkey: string }> {
+  const trimmed = opts.text.trim();
+  if (!trimmed) {
+    throw new Error("Cannot post an empty comment.");
+  }
+  const record = {
+    $type: COLLECTION_COMMENT,
+    subject: { uri: opts.subjectUri, type: "record" },
+    text: trimmed.slice(0, 5000),
+    createdAt: new Date().toISOString(),
+  };
+  const res = await opts.agent.com.atproto.repo.createRecord({
+    repo: opts.did,
+    collection: COLLECTION_COMMENT,
+    record,
+  });
+  return {
+    uri: res.data.uri,
+    cid: res.data.cid,
+    rkey: res.data.uri.split("/").pop() ?? "",
+  };
+}
+
+/**
+ * Sim-attribution sidecar for a comment.
+ *
+ * The `org.impactindexer.review.comment` lexicon has no field for
+ * "this comment is the voice of sim X" — and we don't want to extend
+ * an impactindexer-owned lexicon for a Simocracy-specific concept.
+ * Instead we use Simocracy's existing `org.simocracy.history`
+ * lexicon as a join table:
+ *
+ *   commentUri  ←—  history.subjectUri
+ *   loaded sim  ←—  history.simUris[0] / simNames[0]
+ *
+ * Renderers that understand this pattern (simocracy.org) join the two
+ * sets at display time and show the comment with a sim badge;
+ * renderers that don't (Bluesky AppView, third-party clients) fall
+ * back to displaying the comment as a regular user comment — graceful
+ * degradation, zero lexicon changes anywhere.
+ *
+ * Writes to the *user's* own PDS (the comment author), not a shared
+ * facilitator repo, because the attribution is an event the user
+ * triggered and naturally belongs in their history.
+ */
+export async function createCommentHistory(opts: {
+  agent: Agent;
+  did: string;
+  commentUri: string;
+  simUri: string;
+  simName: string;
+  text: string;
+  /** Title of the parent record (proposal / gathering / sim) — best-effort. */
+  proposalTitle?: string;
+  /** Collection of the parent record — best-effort. */
+  parentCollection?: string;
+  /** Human-readable name of the parent — best-effort, denormalized for the timeline. */
+  parentName?: string;
+}): Promise<{ uri: string; cid: string; rkey: string }> {
+  // Defense-in-depth: the sim must live in the same repo we're writing to.
+  // (If it doesn't, the indexer ingests a history record claiming attribution
+  // for a sim the actor doesn't own — confusing rather than dangerous, but
+  // worth catching here.)
+  assertRepoOwnsSimUri(opts.did, opts.simUri);
+  const record: Record<string, unknown> = {
+    $type: COLLECTION_HISTORY,
+    type: "comment",
+    actorDid: opts.did,
+    simNames: [opts.simName].slice(0, 10),
+    simUris: [opts.simUri].slice(0, 10),
+    subjectUri: opts.commentUri,
+    subjectCollection: COLLECTION_COMMENT,
+    content: opts.text.slice(0, 5000),
+    createdAt: new Date().toISOString(),
+  };
+  if (opts.proposalTitle) {
+    record.proposalTitle = opts.proposalTitle.slice(0, 500);
+  }
+  if (opts.parentName) {
+    record.subjectName = opts.parentName.slice(0, 500);
+  }
+  const res = await opts.agent.com.atproto.repo.createRecord({
+    repo: opts.did,
+    collection: COLLECTION_HISTORY,
+    record,
+  });
+  return {
+    uri: res.data.uri,
+    cid: res.data.cid,
+    rkey: res.data.uri.split("/").pop() ?? "",
+  };
 }
 
 /**

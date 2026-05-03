@@ -48,6 +48,16 @@
  *                             style for the loaded sim to the user's
  *                             PDS. Requires the user to be signed in
  *                             via /sim login AND to own the sim.
+ *  - `simocracy_post_comment` Write a comment on a proposal /
+ *                             gathering / sim / decision / parent
+ *                             comment, attributed to the loaded sim
+ *                             via an `org.simocracy.history` sidecar
+ *                             (no impactindexer lexicon changes).
+ *                             Requires /sim login + ownership.
+ *  - `simocracy_lookup_record` Look up a sim / proposal / gathering /
+ *                             decision / comment by AT-URI or fuzzy
+ *                             name and return its details + comment
+ *                             subtree with sim attribution joined.
  *
  * Note on /login: pi itself ships a built-in `/login` for Anthropic OAuth.
  * To avoid the collision (and to make it explicit you're signing into
@@ -85,6 +95,13 @@ import {
   type StyleRecord,
 } from "./simocracy.ts";
 import {
+  bestNameForRecord,
+  lookupRecord,
+  type LookupKind,
+  type LookupResult,
+  type ResolvedComment,
+} from "./lookup.ts";
+import {
   decodePng,
   renderRgbaToAnsi,
   cropRgba,
@@ -101,6 +118,8 @@ import { readAuth } from "./auth/storage.ts";
 import {
   assertCanWriteToSim,
   createAgents,
+  createComment,
+  createCommentHistory,
   createStyle,
   findRkeyForSim,
   getAuthenticatedAgent,
@@ -601,6 +620,50 @@ const UpdateSimToolParams = Type.Object({
     Type.String({
       description:
         "New speaking style description in markdown. Replaces the existing org.simocracy.style record's `description`. May be passed alone (style-only update) or together with `shortDescription` + `description` (constitution + style update).",
+    }),
+  ),
+});
+
+const PostCommentToolParams = Type.Object({
+  subjectUri: Type.String({
+    description:
+      "AT-URI of the record to comment on. Accepts proposals (org.hypercerts.claim.activity), gatherings (org.simocracy.gathering), sims (org.simocracy.sim), decisions (org.simocracy.decision), or another comment URI for a nested reply. Get one by calling simocracy_lookup_record first if you don't already have it.",
+    minLength: 1,
+  }),
+  text: Type.String({
+    description:
+      "The comment body. Plain text up to ~5000 chars. Write it as the loaded sim would speak \u2014 the sim's persona is already injected into your system prompt, so just say what they'd say.",
+    minLength: 1,
+    maxLength: 5000,
+  }),
+});
+
+const LookupRecordToolParams = Type.Object({
+  query: Type.String({
+    description:
+      "AT-URI (at://did/collection/rkey) or fuzzy name to look up. AT-URI fetches the exact record from its owner's PDS; a name searches the indexer.",
+    minLength: 1,
+  }),
+  kind: Type.Optional(
+    Type.Union(
+      [
+        Type.Literal("auto"),
+        Type.Literal("sim"),
+        Type.Literal("proposal"),
+        Type.Literal("gathering"),
+        Type.Literal("decision"),
+        Type.Literal("comment"),
+      ],
+      {
+        description:
+          "Restrict the search to one record kind. `auto` (default) searches sims + proposals + gatherings + decisions in parallel and returns the best match. `comment` is only meaningful with an AT-URI query \u2014 comments aren't full-text searchable.",
+      },
+    ),
+  ),
+  withComments: Type.Optional(
+    Type.Boolean({
+      description:
+        "Include the full comment subtree in the response, with sim attribution joined from org.simocracy.history sidecars. Default true. Set false for a smaller, record-only response.",
     }),
   ),
 });
@@ -1115,8 +1178,490 @@ export default async function simocracy(pi: ExtensionAPI) {
       };
     },
   });
+
+  // -------------------------------------------------------------------------
+  // Tool: simocracy_post_comment
+  //
+  // Writes a comment on behalf of the currently loaded sim. Two records
+  // are written to the user's PDS:
+  //
+  //   1. org.impactindexer.review.comment   the comment itself (same wire
+  //      shape simocracy.org's webapp writes today, so it threads + renders
+  //      identically there).
+  //   2. org.simocracy.history               sidecar with type="comment",
+  //      simUris=[loadedSim], subjectUri=<comment uri>. Renderers that
+  //      understand the join (simocracy.org, when the planned change
+  //      lands) display a sim badge; renderers that don't see a regular
+  //      user comment — graceful degradation, zero lexicon changes.
+  //
+  // See `docs/SIM_AUTHORED_COMMENTS.md` for the full design.
+  // -------------------------------------------------------------------------
+  pi.registerTool({
+    name: "simocracy_post_comment",
+    label: "Post a comment as the loaded Simocracy sim",
+    description:
+      "Post a comment on a Simocracy record (proposal / gathering / sim / decision / another comment) as the currently loaded sim. The comment text should sound like the sim \u2014 their persona is already in your system prompt. Writes the comment to the user's PDS plus an org.simocracy.history sidecar that attributes the comment to the loaded sim (no impactindexer lexicon changes needed). Use this when the user asks the sim to weigh in on something, comment on a proposal, reply to another comment, or leave their opinion. Requires /sim login + ownership of the loaded sim.",
+    parameters: PostCommentToolParams,
+    async execute(_id, { subjectUri, text }) {
+      if (!loadedSim) {
+        throw new Error(
+          "No sim loaded. Call simocracy_load_sim first \u2014 comments are written on behalf of a specific sim.",
+        );
+      }
+      let auth;
+      try {
+        auth = await assertCanWriteToSim(loadedSim, { action: "post a comment as" });
+      } catch (err) {
+        if (err instanceof NotSignedInError || err instanceof NotSimOwnerError) {
+          throw new Error(err.message);
+        }
+        throw err;
+      }
+      let pdsAgent;
+      try {
+        ({ agent: pdsAgent } = await getAuthenticatedAgent());
+      } catch (err) {
+        if (err instanceof NotSignedInError) throw new Error(err.message);
+        throw new Error(`ATProto auth failed: ${(err as Error).message}`);
+      }
+
+      // Best-effort fetch of the parent record so we can denormalize its
+      // title onto the history sidecar (drives the timeline UX in
+      // simocracy.org). Failure is non-fatal — the comment goes through
+      // either way, the badge just won't carry a title.
+      let parentName: string | undefined;
+      let parentCollection: string | undefined;
+      try {
+        const parsed = parseAtUri(subjectUri);
+        parentCollection = parsed.collection;
+        const { getRecordFromPds } = await import("./simocracy.ts");
+        const parentValue = await getRecordFromPds<Record<string, unknown>>(
+          parsed.did,
+          parsed.collection,
+          parsed.rkey,
+        );
+        parentName = bestNameForRecord(parsed.collection, parentValue);
+      } catch {
+        /* non-fatal — leave parentName undefined */
+      }
+
+      let comment;
+      try {
+        comment = await createComment({
+          agent: pdsAgent,
+          did: auth.did,
+          subjectUri,
+          text,
+        });
+      } catch (err) {
+        throw new Error(`Comment write failed: ${(err as Error).message}`);
+      }
+
+      let attributionUri: string | undefined;
+      let attributionWarning: string | undefined;
+      try {
+        const history = await createCommentHistory({
+          agent: pdsAgent,
+          did: auth.did,
+          commentUri: comment.uri,
+          simUri: loadedSim.uri,
+          simName: loadedSim.name,
+          text,
+          proposalTitle: parentName,
+          parentCollection,
+          parentName,
+        });
+        attributionUri = history.uri;
+      } catch (err) {
+        // Don't fail the whole call — the comment is already on the user's
+        // PDS. The sidecar can be re-written later. Surface the warning so
+        // the LLM can decide whether to retry.
+        attributionWarning = `Sim-attribution sidecar failed: ${(err as Error).message}`;
+      }
+
+      const lines = [
+        `Posted comment as ${loadedSim.name}${loadedSim.handle ? ` (@${loadedSim.handle})` : ""}:`,
+        `  comment URI: ${comment.uri}`,
+      ];
+      if (parentName) lines.push(`  on:          ${parentName} (${subjectUri})`);
+      else lines.push(`  on:          ${subjectUri}`);
+      if (attributionUri) {
+        lines.push(`  attribution: ${attributionUri}  (org.simocracy.history sidecar)`);
+      } else if (attributionWarning) {
+        lines.push(`  WARNING:     ${attributionWarning}`);
+        lines.push(
+          `               The comment is posted but will appear unattributed until a history sidecar is written.`,
+        );
+      }
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: {
+          commentUri: comment.uri,
+          commentRkey: comment.rkey,
+          subjectUri,
+          parentName,
+          parentCollection,
+          simUri: loadedSim.uri,
+          simName: loadedSim.name,
+          attributionUri,
+          attributionWarning,
+        },
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: simocracy_lookup_record
+  //
+  // Look up a sim / proposal / gathering / decision / comment by AT-URI
+  // (exact, fetched from the owner's PDS) or by fuzzy name (fan-out
+  // search across both indexers). Returns the record + comment subtree
+  // with sim attribution joined from org.simocracy.history sidecars.
+  // -------------------------------------------------------------------------
+  pi.registerTool({
+    name: "simocracy_lookup_record",
+    label: "Look up a Simocracy record",
+    description:
+      "Fetch a Simocracy record (sim, proposal, gathering, decision, or comment) by AT-URI or fuzzy name and return its details plus the full comment subtree with sim attribution joined. Use this before `simocracy_post_comment` to find the right `subjectUri`, to inspect what's been said about something, or to read a specific comment thread. Comments authored by sims are flagged with their sim name and AT-URI in the response, so you can tell at a glance which opinions are human and which are sim.",
+    parameters: LookupRecordToolParams,
+    async execute(_id, { query, kind, withComments }) {
+      const { result, alternatives } = await lookupRecord(query, {
+        kind: (kind ?? "auto") as LookupKind,
+        withComments: withComments ?? true,
+      });
+      if (!result) {
+        const tail = alternatives.length
+          ? `\n\nClosest alternatives:\n${alternatives
+              .map((a) => `  - [${a.kind}] ${a.name || "(untitled)"}  ${a.uri}`)
+              .join("\n")}`
+          : "";
+        throw new Error(
+          `No record matching "${query}" (kind=${kind ?? "auto"}).${tail}`,
+        );
+      }
+      return {
+        content: [{ type: "text" as const, text: formatLookupResult(result, alternatives) }],
+        details: {
+          kind: result.kind,
+          uri: result.uri,
+          did: result.did,
+          rkey: result.rkey,
+          collection: result.collection,
+          name: result.name,
+          ownerHandle: result.ownerHandle,
+          attribution: result.attribution,
+          parent: result.parent,
+          commentCount: result.comments?.length ?? 0,
+          simAuthoredCommentCount:
+            result.comments?.filter((c) => c.simUri).length ?? 0,
+          alternatives: alternatives.map((a) => ({
+            kind: a.kind,
+            uri: a.uri,
+            name: a.name,
+          })),
+        },
+      };
+    },
+  });
 }
 
+// ---------------------------------------------------------------------------
+// Lookup-result formatter
+//
+// Renders a `LookupResult` as a compact, LLM-friendly markdown block.
+// Calling out sim-authored comments with a 🐾 prefix is the whole
+// point of the human-vs-sim distinction described in
+// docs/SIM_AUTHORED_COMMENTS.md — keep it visually distinct from plain
+// `@handle` lines.
+// ---------------------------------------------------------------------------
+
+interface SearchHitForFormat {
+  kind: string;
+  uri: string;
+  name: string;
+}
+
+function formatLookupResult(
+  result: LookupResult,
+  alternatives: SearchHitForFormat[] = [],
+): string {
+  const lines: string[] = [];
+  const kindLabel = result.kind.toUpperCase();
+  const ownerLabel = result.ownerHandle ? `@${result.ownerHandle}` : result.did;
+  lines.push(`# [${kindLabel}] ${result.name || "(untitled)"}`);
+  lines.push(`- URI:   ${result.uri}`);
+  lines.push(`- Owner: ${ownerLabel} (${result.did})`);
+
+  // Kind-specific structured fields (status, treasury, dates, contributors
+  // — the operationally important stuff that doesn't fit in a generic
+  // shortDescription block). Rendered as a compact `Field: value` table.
+  const v = result.value;
+  const facts = collectKindFacts(result.kind, v);
+  if (facts.length > 0) {
+    lines.push("");
+    for (const [k, val] of facts) lines.push(`- ${k}: ${val}`);
+  }
+
+  // Long-form summary (shortDescription / description / context). Capped at
+  // ~25 lines so a verbose gathering context doesn't drown the rest of the
+  // tool output.
+  const longText =
+    (typeof v.shortDescription === "string" && v.shortDescription) ||
+    (typeof v.description === "string" && v.description) ||
+    (typeof v.context === "string" && v.context) ||
+    "";
+  if (longText.trim()) {
+    const trimmed = longText.split("\n").slice(0, 25).join("\n");
+    lines.push("");
+    lines.push("## Summary");
+    lines.push(trimmed);
+    if (longText.split("\n").length > 25) {
+      lines.push("… (truncated)");
+    }
+  }
+
+  // Council sims, suggested templates, etc — references the LLM may want
+  // to drill into via another simocracy_lookup_record call.
+  const refBlocks = collectKindRefs(result.kind, v);
+  for (const block of refBlocks) {
+    lines.push("");
+    lines.push(`## ${block.title}`);
+    for (const ref of block.refs) lines.push(`- ${ref}`);
+  }
+
+  // For comments — surface text + parent + attribution.
+  if (result.kind === "comment") {
+    lines.push("");
+    lines.push("## Comment text");
+    lines.push(((v.text as string) || "").trim() || "(empty)");
+    if (result.attribution) {
+      lines.push("");
+      lines.push(
+        `🐾 Posted on behalf of sim **${result.attribution.simName}** (${result.attribution.simUri})`,
+      );
+    } else {
+      lines.push("");
+      lines.push(`Posted by ${ownerLabel} (no sim attribution).`);
+    }
+    if (result.parent) {
+      lines.push("");
+      lines.push(
+        `## Parent (${result.parent.collection})\n- ${result.parent.name || "(untitled)"}\n- ${result.parent.uri}`,
+      );
+    }
+  }
+
+  // Comment subtree summary.
+  if (result.comments && result.comments.length > 0) {
+    const simCount = result.comments.filter((c) => c.simUri).length;
+    const humanCount = result.comments.length - simCount;
+    lines.push("");
+    lines.push(
+      `## Comments (${result.comments.length} total — ${humanCount} human, ${simCount} sim)`,
+    );
+    // Show up to 25 most recent comments, oldest first within that window.
+    const shown = result.comments.slice(-25);
+    for (const c of shown) {
+      lines.push(formatCommentLine(c));
+    }
+    if (result.comments.length > shown.length) {
+      lines.push(
+        `… ${result.comments.length - shown.length} earlier comment(s) omitted from this preview.`,
+      );
+    }
+  } else if (result.kind !== "comment") {
+    lines.push("");
+    lines.push("_No comments yet._");
+  }
+
+  if (alternatives.length > 0) {
+    lines.push("");
+    lines.push("## Other matches");
+    for (const a of alternatives) {
+      lines.push(`- [${a.kind}] ${a.name || "(untitled)"}  ${a.uri}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Per-kind structured facts — status, treasury, allocation mechanism, etc.
+ * Returned as `[label, value]` pairs so the formatter can render them as a
+ * compact key/value list. Only fields with actual values are included; absent
+ * or empty fields are omitted entirely so the output stays tight.
+ */
+function collectKindFacts(
+  kind: string,
+  v: Record<string, unknown>,
+): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  const str = (k: string): string | undefined => {
+    const x = v[k];
+    return typeof x === "string" && x.trim() ? x : undefined;
+  };
+  const num = (k: string): number | undefined => {
+    const x = v[k];
+    return typeof x === "number" ? x : undefined;
+  };
+  const arr = <T = unknown>(k: string): T[] => {
+    const x = v[k];
+    return Array.isArray(x) ? (x as T[]) : [];
+  };
+  switch (kind) {
+    case "gathering": {
+      // Status · type · mechanism on one row — these are the at-a-glance fields.
+      const statusBits = [
+        str("status"),
+        str("gatheringType"),
+        str("allocationMechanism"),
+      ].filter(Boolean) as string[];
+      if (statusBits.length) out.push(["Status", statusBits.join(" · ")]);
+      const treasury = num("treasuryUsd");
+      if (treasury !== undefined) out.push(["Treasury", `$${treasury.toLocaleString()} USD`]);
+      const dates = str("dates");
+      if (dates) out.push(["Dates", dates]);
+      const location = str("location");
+      if (location) out.push(["Location", location]);
+      const url = str("url");
+      if (url) out.push(["URL", url]);
+      const appRoute = str("appRoute");
+      if (appRoute) out.push(["App route", appRoute]);
+      const collectionUri = str("collectionUri");
+      if (collectionUri) out.push(["Proposal collection", collectionUri]);
+      const scopeBits = [
+        str("simScope") && `sims=${str("simScope")}`,
+        str("proposalScope") && `proposals=${str("proposalScope")}`,
+        str("simSize") && `size=${str("simSize")}`,
+      ].filter(Boolean) as string[];
+      if (scopeBits.length) out.push(["Scope", scopeBits.join(", ")]);
+      const council = arr("councilSims");
+      if (council.length) out.push(["Council sims", `${council.length} — see below`]);
+      break;
+    }
+    case "proposal": {
+      const startDate = str("startDate");
+      const endDate = str("endDate");
+      if (startDate || endDate) {
+        out.push(["Dates", `${startDate || "?"} → ${endDate || "?"}`]);
+      }
+      const ws = v.workScope as Record<string, unknown> | undefined;
+      if (ws && typeof ws === "object") {
+        const scope = ws.scope || ws.expression;
+        if (typeof scope === "string" && scope.trim()) {
+          out.push(["Workscope", scope]);
+        }
+      }
+      const contribs = arr<Record<string, unknown>>("contributors");
+      if (contribs.length) {
+        const names = contribs
+          .map((c) => {
+            const ci = c.contributorIdentity;
+            if (typeof ci === "string") return ci;
+            if (ci && typeof ci === "object" && "uri" in ci) {
+              return (ci as { uri: string }).uri;
+            }
+            return null;
+          })
+          .filter((x): x is string => !!x);
+        out.push([
+          "Contributors",
+          names.length
+            ? `${contribs.length} (${names.slice(0, 3).join(", ")}${names.length > 3 ? "…" : ""})`
+            : `${contribs.length}`,
+        ]);
+      }
+      break;
+    }
+    case "decision": {
+      const mech = str("mechanism");
+      if (mech) out.push(["Mechanism", mech]);
+      const budget = num("budget");
+      if (budget !== undefined) out.push(["Budget", `$${budget.toLocaleString()} USD`]);
+      const outside = num("outsideOptionKept");
+      if (outside !== undefined) out.push(["Outside option kept", `$${outside.toLocaleString()} USD`]);
+      const allocs = arr("allocations");
+      if (allocs.length) out.push(["Allocations", `${allocs.length} proposal(s)`]);
+      const decidedAt = str("decidedAt");
+      if (decidedAt) out.push(["Decided at", decidedAt.slice(0, 19)]);
+      const gatheringUri = str("gatheringUri");
+      if (gatheringUri) out.push(["Gathering", gatheringUri]);
+      break;
+    }
+    case "sim": {
+      const spriteKind = str("spriteKind");
+      if (spriteKind) out.push(["Sprite kind", spriteKind]);
+      const created = str("createdAt");
+      if (created) out.push(["Created", created.slice(0, 10)]);
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Per-kind reference blocks — lists of AT-URIs the LLM might want to
+ * `simocracy_lookup_record` next (council sims, allocations breakdown,
+ * etc.). Returned as titled groups so the formatter can render each
+ * block under its own subheading.
+ */
+function collectKindRefs(
+  kind: string,
+  v: Record<string, unknown>,
+): Array<{ title: string; refs: string[] }> {
+  const out: Array<{ title: string; refs: string[] }> = [];
+  const arr = <T = unknown>(k: string): T[] =>
+    Array.isArray(v[k]) ? (v[k] as T[]) : [];
+  if (kind === "gathering") {
+    const council = arr<{ uri?: string }>("councilSims");
+    if (council.length) {
+      out.push({
+        title: "Council sims",
+        refs: council
+          .map((s) => s.uri)
+          .filter((u): u is string => !!u),
+      });
+    }
+    const tmpls = arr<{ uri?: string }>("suggestedInterviewTemplates");
+    if (tmpls.length) {
+      out.push({
+        title: "Suggested interview templates",
+        refs: tmpls.map((t) => t.uri).filter((u): u is string => !!u),
+      });
+    }
+  }
+  if (kind === "decision") {
+    const allocs = arr<Record<string, unknown>>("allocations");
+    if (allocs.length) {
+      out.push({
+        title: "Allocations",
+        refs: allocs.slice(0, 30).map((a) => {
+          const title = (a.proposalTitle as string) || "(untitled)";
+          const amount = a.amount as number | undefined;
+          const requested = a.requested as number | undefined;
+          const uri = (a.proposalUri as string) || "";
+          const amt = amount !== undefined ? `$${amount.toLocaleString()}` : "$?";
+          const req = requested !== undefined ? ` (requested $${requested.toLocaleString()})` : "";
+          return `${amt}${req}  —  ${title}${uri ? `  ${uri}` : ""}`;
+        }),
+      });
+    }
+  }
+  return out;
+}
+
+function formatCommentLine(c: ResolvedComment): string {
+  const author = c.simUri
+    ? `🐾 ${c.simName} (sim, written by ${c.authorHandle ? `@${c.authorHandle}` : c.did.slice(0, 16) + "…"})`
+    : c.authorHandle
+      ? `@${c.authorHandle}`
+      : c.did.slice(0, 16) + "…";
+  const when = (c.createdAt || "").slice(0, 19);
+  const head = `- [${when}] ${author}`;
+  const body = c.text.length > 240 ? c.text.slice(0, 237) + "…" : c.text;
+  // Indent body two spaces under the bullet so it stays visually grouped.
+  return `${head}\n  ${body.replace(/\n/g, "\n  ")}`;
+}
 
 // ---------------------------------------------------------------------------
 // Slash-command flow

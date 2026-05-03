@@ -12,12 +12,17 @@ A `pi` extension. Single deliverable: an npm package called
 adds:
 
 1. The `/sim <name>` slash command (and `/sim status`, `/sim unload`).
-2. Four LLM-callable tools: `simocracy_load_sim`,
-   `simocracy_unload_sim`, `simocracy_chat`, `simocracy_update_sim`.
-   The first three are read-only / session-local; `simocracy_update_sim`
-   is the **only** PDS write surface this extension exposes — it
-   writes a new constitution and/or speaking style for the loaded sim
-   to the user's repo, gated on `/sim login` + ownership.
+2. Six LLM-callable tools: `simocracy_load_sim`,
+   `simocracy_unload_sim`, `simocracy_chat`, `simocracy_update_sim`,
+   `simocracy_post_comment`, `simocracy_lookup_record`.
+   The first three are read-only / session-local;
+   `simocracy_lookup_record` is read-only across both indexers + PDSs;
+   `simocracy_update_sim` and `simocracy_post_comment` are the **only**
+   PDS write surfaces this extension exposes — the former writes a new
+   constitution and/or speaking style for the loaded sim, the latter
+   writes a comment record plus an `org.simocracy.history` sidecar
+   that attributes the comment to the loaded sim. Both write paths are
+   gated on `/sim login` + sim ownership.
 3. A `before_agent_start` event handler that injects the loaded sim's
    constitution and speaking style into pi's system prompt every turn.
 4. A custom message renderer (`simocracy_sim_loaded`) that prints the
@@ -39,15 +44,18 @@ here — push back to a separate extension.
 ├── tsconfig.json       # strict TS, bundler resolution, allowImportingTsExtensions
 ├── .npmrc              # legacy-peer-deps=true (peer deps are pi internals)
 ├── src/
-│   ├── index.ts        # extension entry — registers slash cmd + 4 tools + handlers
+│   ├── index.ts        # extension entry — registers slash cmd + 6 tools + handlers
 │   ├── persona.ts      # buildSimPrompt(sim) — the system-prompt fragment
 │   ├── simocracy.ts    # GraphQL indexer client + PDS client (read-only)
-│   ├── writes.ts       # PDS writers (agents + style) + auth / ownership preconditions
+│   ├── lookup.ts       # record lookup + comment-subtree fetch + sim-attribution join (used by simocracy_lookup_record)
+│   ├── writes.ts       # PDS writers (agents, style, comment, history sidecar) + auth / ownership preconditions
 │   ├── png-to-ansi.ts  # RGBA half-block ANSI renderer (pngjs-backed) + downscalers
 │   ├── png-encode.ts   # RGBA → PNG encoder for inline-graphics protocols (Kitty/iTerm2)
 │   ├── webp-to-rgba.ts # @jsquash/webp wrapper for codex pet WebP sheets (lazy wasm init)
 │   ├── openrouter.ts   # minimal OpenRouter client (only simocracy_chat uses it)
 │   └── auth/           # ATProto loopback OAuth flow + session storage
+├── docs/
+│   └── SIM_AUTHORED_COMMENTS.md  # design: how sim-authored comments work without lexicon changes
 └── demo/
     ├── sim-load.tape       # vhs tape — Mr Meow (pipoya) load → chat → unload
     └── codex-pet-load.tape # vhs tape — Einstein (codex pet) load → chat → unload
@@ -144,26 +152,34 @@ in **Verifying changes** below.
 
 ---
 
-## Lexicons used (read-only)
+## Lexicons used
 
-ATProto records are fetched via standard XRPC. The only write surface
-is `simocracy_update_sim` (constitution + style only); the `sim`,
-`petSheet`, and `image` blobs are owned by simocracy.org's create flow.
-The Simocracy lexicons we read:
+ATProto records are fetched via standard XRPC. Two write surfaces:
+`simocracy_update_sim` (constitution + style for the loaded sim) and
+`simocracy_post_comment` (a comment record plus an
+`org.simocracy.history` sidecar that attributes the comment to the
+loaded sim). The `sim`, `petSheet`, and `image` blobs are owned by
+simocracy.org's create flow — we never touch those.
 
-| NSID                           | Records pulled                                                            |
-|--------------------------------|---------------------------------------------------------------------------|
-| `org.simocracy.sim`            | name, `spriteKind`, sprite/image blob refs, codex pet `petSheet` + `petManifest` |
-| `org.simocracy.agents`         | shortDescription + full constitution                                      |
-| `org.simocracy.style`          | speaking style / mannerisms                                               |
+| NSID                                  | R/W | What we do with it                                                        |
+|---------------------------------------|-----|---------------------------------------------------------------------------|
+| `org.simocracy.sim`                   | R   | name, `spriteKind`, sprite/image blob refs, codex pet `petSheet` + `petManifest` |
+| `org.simocracy.agents`                | R/W | shortDescription + full constitution — written by `simocracy_update_sim`  |
+| `org.simocracy.style`                 | R/W | speaking style / mannerisms — written by `simocracy_update_sim`           |
+| `org.simocracy.gathering`             | R   | governance / funding events; surfaced by `simocracy_lookup_record`        |
+| `org.simocracy.decision`              | R   | published allocation outcomes; surfaced by `simocracy_lookup_record`      |
+| `org.simocracy.history`               | R/W | **read** to join sim attribution onto comments (type=`comment`, subjectUri=commentUri); **written** by `simocracy_post_comment` as the sim-attribution sidecar |
+| `org.hypercerts.claim.activity`       | R   | proposals — surfaced by `simocracy_lookup_record`                         |
+| `org.impactindexer.review.comment`    | R/W | comment threads on any record; **written** by `simocracy_post_comment`. We do **not** extend this lexicon — sim attribution is carried by an `org.simocracy.history` sidecar instead. See `docs/SIM_AUTHORED_COMMENTS.md` for the design rationale and the renderer changes simocracy-v2 needs. |
 
 Plus blobs via `com.atproto.sync.getBlob` (with redirect-follow because
 bsky.social returns 302 to its CDN).
 
 If you need a record we don't currently fetch, add a function in
-`src/simocracy.ts` (don't sprinkle XRPC calls across `index.ts`) and
-a corresponding field on `LoadedSim`. Keep the indexer-first +
-PDS-fallback pattern for anything user-facing.
+`src/simocracy.ts` or `src/lookup.ts` (don't sprinkle XRPC calls
+across `index.ts`) and a corresponding field on `LoadedSim` or
+`LookupResult`. Keep the indexer-first + PDS-fallback pattern for
+anything user-facing.
 
 ---
 
