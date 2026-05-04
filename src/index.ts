@@ -487,6 +487,26 @@ async function renderSprite(sim: SimMatch): Promise<SpriteRender | null> {
   return null;
 }
 
+/**
+ * Subcommand keywords reserved by the `/sim` dispatcher. The dispatcher
+ * routes these BEFORE falling through to `runLoadFlow`, but we also
+ * guard the load flow itself against them as defense-in-depth — if a
+ * future regression ever leaks one of these into `runLoadFlow`, the
+ * user gets a "did you mean…?" hint instead of a misleading
+ * "Searching for 'login'…" + indexer-fetch error.
+ */
+const RESERVED_SUBCOMMANDS = new Set([
+  "help",
+  "login",
+  "logout",
+  "whoami",
+  "my",
+  "mine",
+  "unload",
+  "clear",
+  "status",
+]);
+
 async function loadSimByName(query: string): Promise<{
   matches: SimMatch[];
   loaded?: LoadedSim;
@@ -496,7 +516,15 @@ async function loadSimByName(query: string): Promise<{
   try {
     matches = await searchSimsByName(query, { maxResults: 8 });
   } catch (err) {
-    return { matches: [], error: `Indexer search failed: ${(err as Error).message}` };
+    const msg = (err as Error).message;
+    // Node's "fetch failed" is opaque — the user can't tell whether the
+    // indexer is down, their network is down, or DNS is broken. Rewrite
+    // it into something actionable.
+    const friendly =
+      msg === "fetch failed" || msg.includes("fetch failed")
+        ? "could not reach the Simocracy indexer at simocracy-indexer-production.up.railway.app — check your internet connection"
+        : msg;
+    return { matches: [], error: `Indexer search failed: ${friendly}` };
   }
   if (matches.length === 0) {
     return { matches: [], error: `No sim found matching "${query}".` };
@@ -927,8 +955,18 @@ export default async function simocracy(pi: ExtensionAPI) {
     description:
       "Simocracy: load sims, edit your own sim's constitution/style, sign into ATProto. `/sim help` for the full list.",
     handler: async (args, ctx) => {
-      const arg = args.trim();
-      if (!arg || arg === "help" || arg === "--help") {
+      // Strip zero-width / format characters that survive `.trim()` —
+      // a stray U+200B (ZWSP) glued onto "login" by a paste from a
+      // chat client is enough to make `arg === "login"` fail and
+      // route the request through `runLoadFlow` as if it were a sim
+      // name. We match subcommand keywords against the *lowercased*
+      // form, but pass the original-case clean arg through to handlers
+      // (sim names are user-facing strings; preserve their case).
+      const arg = args
+        .trim()
+        .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, "");
+      const argLower = arg.toLowerCase();
+      if (!arg || argLower === "help" || argLower === "--help") {
         ctx.ui.notify(
           "Sim:\n" +
             "  /sim <name>            load a sim (e.g. /sim mr meow)\n" +
@@ -955,27 +993,28 @@ export default async function simocracy(pi: ExtensionAPI) {
       }
       // ATProto auth subcommands — must come BEFORE the sim-name
       // fallthrough (`runLoadFlow`) so we don't accidentally treat
-      // "login" as a sim name to load from the indexer.
-      if (arg === "login" || arg.startsWith("login ") || arg.startsWith("login\t")) {
+      // "login" as a sim name to load from the indexer. Match on
+      // `argLower` so `/sim Login` and `/sim LOGIN` route the same way.
+      if (argLower === "login" || argLower.startsWith("login ") || argLower.startsWith("login\t")) {
         const rest = arg.slice("login".length).trim();
         await runLogin(ctx, rest);
         return;
       }
-      if (arg === "logout") {
+      if (argLower === "logout") {
         await runLogout(ctx);
         return;
       }
-      if (arg === "whoami") {
+      if (argLower === "whoami") {
         await runWhoami(ctx);
         return;
       }
-      if (arg === "my" || arg === "mine" || arg.startsWith("my ") || arg.startsWith("my\t") || arg.startsWith("mine ") || arg.startsWith("mine\t")) {
-        const headLen = arg.startsWith("mine") ? 4 : 2;
+      if (argLower === "my" || argLower === "mine" || argLower.startsWith("my ") || argLower.startsWith("my\t") || argLower.startsWith("mine ") || argLower.startsWith("mine\t")) {
+        const headLen = argLower.startsWith("mine") ? 4 : 2;
         const rest = arg.slice(headLen).trim();
         await runMySimsCommand(pi, ctx, rest);
         return;
       }
-      if (arg === "unload" || arg === "clear") {
+      if (argLower === "unload" || argLower === "clear") {
         if (!loadedSim) {
           ctx.ui.notify("No sim loaded.", "info");
           return;
@@ -989,7 +1028,7 @@ export default async function simocracy(pi: ExtensionAPI) {
         ctx.ui.notify(`Unloaded ${name}. Pi will break character on the next reply.`, "info");
         return;
       }
-      if (arg === "status") {
+      if (argLower === "status") {
         if (!loadedSim) {
           ctx.ui.notify("No sim loaded. Try `/sim mr meow`.", "info");
           return;
@@ -2096,6 +2135,19 @@ async function runLoadFlow(
   ctx: ExtensionCommandContext,
   arg: string,
 ): Promise<void> {
+  // Defense-in-depth: if a reserved subcommand keyword somehow ends up
+  // here (e.g. dispatcher regression, exotic input that bypassed the
+  // case + zero-width normalization in the `/sim` handler), refuse to
+  // search the indexer for it. Otherwise the user sees a misleading
+  // `Searching for "login"…` followed by an indexer-fetch error.
+  const argTrimmed = arg.trim();
+  if (RESERVED_SUBCOMMANDS.has(argTrimmed.toLowerCase())) {
+    ctx.ui.notify(
+      `\`${argTrimmed}\` is a reserved subcommand. Did you mean \`/sim ${argTrimmed.toLowerCase()}\`? Run \`/sim help\` for the full list.`,
+      "error",
+    );
+    return;
+  }
   ctx.ui.notify(`Searching for "${arg}"…`, "info");
   let matches: SimMatch[] = [];
   if (arg.startsWith("at://")) {
