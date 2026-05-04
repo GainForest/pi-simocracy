@@ -54,6 +54,13 @@
  *                             via an `org.simocracy.history` sidecar
  *                             (no impactindexer lexicon changes).
  *                             Requires /sim login + ownership.
+ *  - `simocracy_post_proposal` Submit a new funding proposal
+ *                             (`org.hypercerts.claim.activity`) on
+ *                             behalf of the loaded sim, plus an
+ *                             `org.simocracy.history` sidecar with
+ *                             `type: "proposal"`. Same write pattern
+ *                             as `simocracy_post_comment`. Requires
+ *                             /sim login + sim ownership.
  *  - `simocracy_lookup_record` Look up a sim / proposal / gathering /
  *                             decision / comment by AT-URI or fuzzy
  *                             name and return its details + comment
@@ -120,6 +127,8 @@ import {
   createAgents,
   createComment,
   createCommentHistory,
+  createProposal,
+  createProposalHistory,
   createStyle,
   findRkeyForSim,
   getAuthenticatedAgent,
@@ -636,6 +645,115 @@ const PostCommentToolParams = Type.Object({
     minLength: 1,
     maxLength: 5000,
   }),
+});
+
+/**
+ * Default cover image used by simocracy.org's `ProposalFormDialog` when the
+ * user doesn't upload anything. We mirror that exactly so a pi-authored
+ * proposal renders with the same banner as a webapp-authored one.
+ */
+const DEFAULT_PROPOSAL_BANNER_URI =
+  "https://www.simocracy.org/ftc-sf-default.jpeg";
+
+/**
+ * Mirror of simocracy-v2's `appendBudgetToDescription` — markers verbatim
+ * from `lib/budget-items.ts` so the block round-trips through the
+ * webapp's `parseDescriptionWithBudget` reader untouched. We only
+ * implement the *append* side here; pi-simocracy never parses
+ * existing descriptions back out (proposals are create-only).
+ *
+ * Returns the description unchanged when `items` is empty or contains
+ * no valid (non-empty name + positive amount) entries.
+ */
+const BUDGET_HEADER = "━━━ Budget Request ━━━";
+const TOTAL_PREFIX = "━━━ Total: ";
+const TOTAL_SUFFIX = " ━━━";
+
+function formatProposalUsd(amount: number): string {
+  const hasDecimals = !Number.isInteger(amount);
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: hasDecimals ? 2 : 0,
+    maximumFractionDigits: 2,
+  }).format(amount);
+}
+
+function appendBudgetToDescription(
+  description: string,
+  items: Array<{ item: string; amountUsd: number }>,
+): string {
+  const valid = items.filter(
+    (i) => i.item.trim() !== "" && i.amountUsd > 0 && Number.isFinite(i.amountUsd),
+  );
+  if (valid.length === 0) return description;
+  const total = valid.reduce((sum, i) => sum + i.amountUsd, 0);
+  const block = [
+    BUDGET_HEADER,
+    ...valid.map(
+      (i) => `• ${i.item.trim()} — ${formatProposalUsd(i.amountUsd)}`,
+    ),
+    `${TOTAL_PREFIX}${formatProposalUsd(total)}${TOTAL_SUFFIX}`,
+  ].join("\n");
+  const base = description.trim();
+  return base ? `${base}\n\n${block}` : block;
+}
+
+const PostProposalToolParams = Type.Object({
+  title: Type.String({
+    description:
+      "Proposal title in the sim's voice. Required, max 256 chars. The sim is already in your system prompt — write the title as they'd phrase it.",
+    minLength: 1,
+    maxLength: 256,
+  }),
+  shortDescription: Type.String({
+    description:
+      "One- or two-sentence pitch for the proposal, in the sim's voice. Required, max 300 chars. Shows up in proposal lists on simocracy.org.",
+    minLength: 1,
+    maxLength: 300,
+  }),
+  description: Type.Optional(
+    Type.String({
+      description:
+        "Long-form proposal body in the sim's voice. Plain text. Optional — pass when the user has discussed the project in detail. If `budgetItems` is also passed, an itemized budget block is appended automatically.",
+    }),
+  ),
+  workScope: Type.Optional(
+    Type.String({
+      description:
+        "Comma-separated tags describing the work scope (e.g. \"urban agriculture, food security\"). Optional. Stored as a bare string the same way simocracy.org's webapp writes it.",
+    }),
+  ),
+  contributors: Type.Optional(
+    Type.Array(Type.String({ minLength: 1 }), {
+      description:
+        "DIDs, handles, or freeform names of people credited as contributors. One entry per contributor. Optional.",
+    }),
+  ),
+  budgetItems: Type.Optional(
+    Type.Array(
+      Type.Object({
+        item: Type.String({
+          minLength: 1,
+          description: "What the line-item is funding (e.g. \"Solar panels\").",
+        }),
+        amountUsd: Type.Number({
+          minimum: 0,
+          description: "USD amount for this line-item. Must be > 0 to be included.",
+        }),
+      }),
+      {
+        description:
+          "Itemized budget request. When provided, an `━━━ Budget Request ━━━` block is appended to `description` so it renders the same way simocracy.org's proposal form writes it. Pass when the user discussed a budget; omit when they didn't.",
+      },
+    ),
+  ),
+  imageUri: Type.Optional(
+    Type.String({
+      description:
+        "https URL for the cover image. Defaults to the Simocracy banner if omitted. Image upload from disk is not supported — pass a URL or leave blank.",
+    }),
+  ),
 });
 
 const LookupRecordToolParams = Type.Object({
@@ -1305,6 +1423,162 @@ export default async function simocracy(pi: ExtensionAPI) {
           simName: loadedSim.name,
           attributionUri,
           attributionWarning,
+        },
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: simocracy_post_proposal
+  //
+  // Submit a new funding proposal on behalf of the loaded sim. Two
+  // records are written to the user's PDS, mirroring simocracy_post_comment:
+  //
+  //   1. org.hypercerts.claim.activity   the proposal itself, in the same
+  //      wire shape simocracy.org's ProposalFormDialog writes today, so it
+  //      renders identically in the webapp.
+  //   2. org.simocracy.history           sidecar with type="proposal",
+  //      simUris=[loadedSim], subjectUri=<proposal uri>. Renderers that
+  //      understand the join show the sim badge; others see a regular
+  //      proposal — graceful degradation, zero lexicon changes.
+  //
+  // See `docs/SIM_AUTHORED_PROPOSALS.md` for the full design.
+  // -------------------------------------------------------------------------
+  pi.registerTool({
+    name: "simocracy_post_proposal",
+    label: "Submit a Simocracy proposal as the loaded sim",
+    description:
+      "Submit a new funding proposal to Simocracy on behalf of the currently loaded sim. The sim should write the title + shortDescription + description in their own voice (their persona is already in your system prompt). Writes the proposal to the user's PDS plus an org.simocracy.history sidecar attributing the draft to the loaded sim. Use this when the user asks the sim to draft, propose, or submit a proposal — e.g. \"Mr Meow, propose a cat sanctuary\" or \"draft a proposal for solar panels\". Pass `budgetItems` if a budget request was discussed; pass `workScope` for tag-style categorization; pass `contributors` for credited humans. Image is optional and URL-only (the default Simocracy banner is used otherwise). Requires /sim login + a loaded sim the user owns.",
+    parameters: PostProposalToolParams,
+    async execute(
+      _id,
+      { title, shortDescription, description, workScope, contributors, budgetItems, imageUri },
+    ) {
+      if (!loadedSim) {
+        throw new Error(
+          "No sim loaded. Call simocracy_load_sim first — proposals are submitted on behalf of a specific sim.",
+        );
+      }
+      let auth;
+      try {
+        auth = await assertCanWriteToSim(loadedSim, { action: "post a proposal as" });
+      } catch (err) {
+        if (err instanceof NotSignedInError || err instanceof NotSimOwnerError) {
+          throw new Error(err.message);
+        }
+        throw err;
+      }
+      let pdsAgent;
+      try {
+        ({ agent: pdsAgent } = await getAuthenticatedAgent());
+      } catch (err) {
+        if (err instanceof NotSignedInError) throw new Error(err.message);
+        throw new Error(`ATProto auth failed: ${(err as Error).message}`);
+      }
+
+      // Resolve the cover image — either an LLM-supplied https URL or
+      // the simocracy.org default banner. Reject non-https schemes
+      // (data:, javascript:, file://) defensively even though the only
+      // real downstream consumer is the webapp's <Image> component.
+      let imageRef: { $type: "org.hypercerts.defs#uri"; uri: string };
+      if (imageUri !== undefined) {
+        const trimmed = imageUri.trim();
+        if (!/^https:\/\//i.test(trimmed)) {
+          throw new Error(
+            `imageUri must be an https URL (got "${trimmed}"). Pass an https URL, or omit imageUri to use the default Simocracy banner.`,
+          );
+        }
+        imageRef = { $type: "org.hypercerts.defs#uri", uri: trimmed };
+      } else {
+        imageRef = { $type: "org.hypercerts.defs#uri", uri: DEFAULT_PROPOSAL_BANNER_URI };
+      }
+
+      // Append the budget block (if any) to the user-authored description,
+      // exactly the same way simocracy.org's ProposalFormDialog does.
+      const baseDescription = description?.trim() ?? "";
+      const finalDescription = budgetItems
+        ? appendBudgetToDescription(baseDescription, budgetItems)
+        : baseDescription;
+
+      // Build contributors in the lexicon shape:
+      // `Array<{ contributorIdentity: string }>`. Drop blank entries.
+      const contributorRecords =
+        contributors && contributors.length > 0
+          ? contributors
+              .map((c) => c.trim())
+              .filter((c) => c.length > 0)
+              .map((contributorIdentity) => ({ contributorIdentity }))
+          : undefined;
+
+      let proposal;
+      try {
+        proposal = await createProposal({
+          agent: pdsAgent,
+          did: auth.did,
+          title,
+          shortDescription,
+          description: finalDescription || undefined,
+          workScope: workScope?.trim() || undefined,
+          contributors:
+            contributorRecords && contributorRecords.length > 0
+              ? contributorRecords
+              : undefined,
+          image: imageRef,
+        });
+      } catch (err) {
+        throw new Error(`Proposal write failed: ${(err as Error).message}`);
+      }
+
+      let sidecarUri: string | undefined;
+      let sidecarWarning: string | undefined;
+      try {
+        const history = await createProposalHistory({
+          agent: pdsAgent,
+          did: auth.did,
+          proposalUri: proposal.uri,
+          proposalTitle: title,
+          simUri: loadedSim.uri,
+          simName: loadedSim.name,
+          content: finalDescription || shortDescription,
+        });
+        sidecarUri = history.uri;
+      } catch (err) {
+        // Don't roll back — the proposal is already on the user's PDS.
+        // The sidecar can be re-written later. Surface the warning so the
+        // LLM can decide whether to retry.
+        sidecarWarning = `Sim-attribution sidecar failed: ${(err as Error).message}`;
+      }
+
+      const lines = [
+        `Submitted proposal as ${loadedSim.name}${loadedSim.handle ? ` (@${loadedSim.handle})` : ""}:`,
+        `  title:        ${title}`,
+        `  proposal URI: ${proposal.uri}`,
+        `  image:        ${imageRef.uri}`,
+      ];
+      if (sidecarUri) {
+        lines.push(`  attribution:  ${sidecarUri}  (org.simocracy.history sidecar)`);
+      } else if (sidecarWarning) {
+        lines.push(`  WARNING:      ${sidecarWarning}`);
+        lines.push(
+          `                The proposal is posted but will appear unattributed until a history sidecar is written.`,
+        );
+      }
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: {
+          proposalUri: proposal.uri,
+          proposalRkey: proposal.rkey,
+          proposalCid: proposal.cid,
+          title,
+          shortDescription,
+          imageUri: imageRef.uri,
+          workScope: workScope?.trim() || undefined,
+          contributors: contributorRecords,
+          budgetItemCount: budgetItems?.length ?? 0,
+          simUri: loadedSim.uri,
+          simName: loadedSim.name,
+          sidecarUri,
+          sidecarWarning,
         },
       };
     },

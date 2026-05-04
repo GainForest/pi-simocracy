@@ -12,16 +12,20 @@ A `pi` extension. Single deliverable: an npm package called
 adds:
 
 1. The `/sim <name>` slash command (and `/sim status`, `/sim unload`).
-2. Six LLM-callable tools: `simocracy_load_sim`,
+2. Seven LLM-callable tools: `simocracy_load_sim`,
    `simocracy_unload_sim`, `simocracy_chat`, `simocracy_update_sim`,
-   `simocracy_post_comment`, `simocracy_lookup_record`.
+   `simocracy_post_comment`, `simocracy_post_proposal`,
+   `simocracy_lookup_record`.
    The first three are read-only / session-local;
    `simocracy_lookup_record` is read-only across both indexers + PDSs;
-   `simocracy_update_sim` and `simocracy_post_comment` are the **only**
-   PDS write surfaces this extension exposes — the former writes a new
-   constitution and/or speaking style for the loaded sim, the latter
-   writes a comment record plus an `org.simocracy.history` sidecar
-   that attributes the comment to the loaded sim. Both write paths are
+   `simocracy_update_sim`, `simocracy_post_comment`, and
+   `simocracy_post_proposal` are the **only** PDS write surfaces this
+   extension exposes — the first writes a new constitution and/or
+   speaking style for the loaded sim, the second writes a comment
+   record plus an `org.simocracy.history` sidecar attributing the
+   comment to the loaded sim, the third writes an
+   `org.hypercerts.claim.activity` proposal record plus a
+   `type: "proposal"` history sidecar. All three write paths are
    gated on `/sim login` + sim ownership.
 3. A `before_agent_start` event handler that injects the loaded sim's
    constitution and speaking style into pi's system prompt every turn.
@@ -48,14 +52,15 @@ here — push back to a separate extension.
 │   ├── persona.ts      # buildSimPrompt(sim) — the system-prompt fragment
 │   ├── simocracy.ts    # GraphQL indexer client + PDS client (read-only)
 │   ├── lookup.ts       # record lookup + comment-subtree fetch + sim-attribution join (used by simocracy_lookup_record)
-│   ├── writes.ts       # PDS writers (agents, style, comment, history sidecar) + auth / ownership preconditions
+│   ├── writes.ts       # PDS writers (agents, style, comment, proposal, history sidecar) + auth / ownership preconditions
 │   ├── png-to-ansi.ts  # RGBA half-block ANSI renderer (pngjs-backed) + downscalers
 │   ├── png-encode.ts   # RGBA → PNG encoder for inline-graphics protocols (Kitty/iTerm2)
 │   ├── webp-to-rgba.ts # @jsquash/webp wrapper for codex pet WebP sheets (lazy wasm init)
 │   ├── openrouter.ts   # minimal OpenRouter client (only simocracy_chat uses it)
 │   └── auth/           # ATProto loopback OAuth flow + session storage
 ├── docs/
-│   └── SIM_AUTHORED_COMMENTS.md  # design: how sim-authored comments work without lexicon changes
+│   ├── SIM_AUTHORED_COMMENTS.md  # design: how sim-authored comments work without lexicon changes
+│   └── SIM_AUTHORED_PROPOSALS.md # design: same pattern, applied to org.hypercerts.claim.activity proposals
 └── demo/
     ├── sim-load.tape       # vhs tape — Mr Meow (pipoya) load → chat → unload
     └── codex-pet-load.tape # vhs tape — Einstein (codex pet) load → chat → unload
@@ -168,8 +173,8 @@ simocracy.org's create flow — we never touch those.
 | `org.simocracy.style`                 | R/W | speaking style / mannerisms — written by `simocracy_update_sim`           |
 | `org.simocracy.gathering`             | R   | governance / funding events; surfaced by `simocracy_lookup_record`        |
 | `org.simocracy.decision`              | R   | published allocation outcomes; surfaced by `simocracy_lookup_record`      |
-| `org.simocracy.history`               | R/W | **read** to join sim attribution onto comments (type=`comment`, subjectUri=commentUri); **written** by `simocracy_post_comment` as the sim-attribution sidecar |
-| `org.hypercerts.claim.activity`       | R   | proposals — surfaced by `simocracy_lookup_record`                         |
+| `org.simocracy.history`               | R/W | **read** to join sim attribution onto comments (type=`comment`, subjectUri=commentUri); **written** by `simocracy_post_comment` (type=`comment`) and `simocracy_post_proposal` (type=`proposal`) as the sim-attribution sidecar |
+| `org.hypercerts.claim.activity`       | R/W | proposals — surfaced by `simocracy_lookup_record`; **written** by `simocracy_post_proposal` in the same wire shape simocracy.org's `ProposalFormDialog` writes today. See `docs/SIM_AUTHORED_PROPOSALS.md`. |
 | `org.impactindexer.review.comment`    | R/W | comment threads on any record; **written** by `simocracy_post_comment`. We do **not** extend this lexicon — sim attribution is carried by an `org.simocracy.history` sidecar instead. See `docs/SIM_AUTHORED_COMMENTS.md` for the design rationale and the renderer changes simocracy-v2 needs. |
 
 Plus blobs via `com.atproto.sync.getBlob` (with redirect-follow because

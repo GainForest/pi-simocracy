@@ -129,6 +129,7 @@ const COLLECTION_AGENTS = "org.simocracy.agents";
 const COLLECTION_STYLE = "org.simocracy.style";
 const COLLECTION_COMMENT = "org.impactindexer.review.comment";
 const COLLECTION_HISTORY = "org.simocracy.history";
+const COLLECTION_PROPOSAL = "org.hypercerts.claim.activity";
 
 /**
  * Defense-in-depth: every write helper below verifies the target
@@ -377,6 +378,128 @@ export async function createCommentHistory(opts: {
   }
   if (opts.parentName) {
     record.subjectName = opts.parentName.slice(0, 500);
+  }
+  const res = await opts.agent.com.atproto.repo.createRecord({
+    repo: opts.did,
+    collection: COLLECTION_HISTORY,
+    record,
+  });
+  return {
+    uri: res.data.uri,
+    cid: res.data.cid,
+    rkey: res.data.uri.split("/").pop() ?? "",
+  };
+}
+
+/**
+ * POST `org.hypercerts.claim.activity` (a funding proposal).
+ *
+ * Matches the wire shape simocracy.org's `ProposalFormDialog` writes
+ * today (`title`, `shortDescription`, optional `description` /
+ * `workScope` / `contributors` / `image`, `createdAt`), so proposals
+ * authored from pi render identically in the webapp.
+ *
+ * No sim-attribution lives in this record. Sim attribution is a
+ * sidecar `org.simocracy.history` written by `createProposalHistory`
+ * below — same pattern as comments, see
+ * `docs/SIM_AUTHORED_PROPOSALS.md` for the design rationale.
+ *
+ * The proposal itself is the *user's*, not the sim's, so this writer
+ * does NOT call `assertRepoOwnsSimUri` — the only precondition is
+ * that the user is signed in (enforced at the tool entry point via
+ * `assertCanWriteToSim`, which also requires a loaded sim because
+ * attribution requires one).
+ */
+export async function createProposal(opts: {
+  agent: Agent;
+  did: string;
+  title: string;
+  shortDescription: string;
+  description?: string;
+  workScope?: string;
+  contributors?: Array<{ contributorIdentity: string }>;
+  image?: { $type: "org.hypercerts.defs#uri"; uri: string };
+}): Promise<{ uri: string; cid: string; rkey: string }> {
+  const title = opts.title.trim();
+  if (!title) throw new Error("Proposal title is required.");
+  const shortDescription = opts.shortDescription.trim();
+  if (!shortDescription)
+    throw new Error("Proposal shortDescription is required.");
+  const record: Record<string, unknown> = {
+    $type: COLLECTION_PROPOSAL,
+    title: title.slice(0, 256),
+    shortDescription: shortDescription.slice(0, 300),
+    createdAt: new Date().toISOString(),
+  };
+  if (opts.description !== undefined) {
+    const body = opts.description.trim();
+    if (body) record.description = body;
+  }
+  if (opts.workScope !== undefined) {
+    const ws = opts.workScope.trim();
+    if (ws) record.workScope = ws;
+  }
+  if (opts.contributors && opts.contributors.length > 0) {
+    record.contributors = opts.contributors;
+  }
+  if (opts.image) record.image = opts.image;
+  const res = await opts.agent.com.atproto.repo.createRecord({
+    repo: opts.did,
+    collection: COLLECTION_PROPOSAL,
+    record,
+  });
+  return {
+    uri: res.data.uri,
+    cid: res.data.cid,
+    rkey: res.data.uri.split("/").pop() ?? "",
+  };
+}
+
+/**
+ * Sim-attribution sidecar for a proposal.
+ *
+ * Mirrors `createCommentHistory` exactly — same `org.simocracy.history`
+ * lexicon, same join key shape, just `type: "proposal"` and
+ * `subjectCollection: "org.hypercerts.claim.activity"`. The lexicon's
+ * `type` field is free-form string; the webapp doesn't filter
+ * histories by `type === "proposal"` today, but adding a new value is
+ * fine (history.json already documents that new event types are
+ * appended over time).
+ *
+ * Writes to the *user's* own PDS, not a shared facilitator repo —
+ * the attribution is an event the user triggered and naturally
+ * belongs in their history.
+ */
+export async function createProposalHistory(opts: {
+  agent: Agent;
+  did: string;
+  proposalUri: string;
+  proposalTitle: string;
+  simUri: string;
+  simName: string;
+  /** Plain-text description, denormalized for the timeline (truncated to ~5000 chars). */
+  content?: string;
+}): Promise<{ uri: string; cid: string; rkey: string }> {
+  // Defense-in-depth: the sim must live in the same repo we're writing to.
+  // The proposal record itself isn't sim-owned, but the history sidecar
+  // *claims attribution to* a sim — only the sim's owner can make that claim.
+  assertRepoOwnsSimUri(opts.did, opts.simUri);
+  const title = opts.proposalTitle.trim();
+  const record: Record<string, unknown> = {
+    $type: COLLECTION_HISTORY,
+    type: "proposal",
+    actorDid: opts.did,
+    simNames: [opts.simName].slice(0, 10),
+    simUris: [opts.simUri].slice(0, 10),
+    subjectUri: opts.proposalUri,
+    subjectCollection: COLLECTION_PROPOSAL,
+    subjectName: title.slice(0, 500),
+    proposalTitle: title.slice(0, 500),
+    createdAt: new Date().toISOString(),
+  };
+  if (opts.content) {
+    const trimmed = opts.content.trim();
+    if (trimmed) record.content = trimmed.slice(0, 5000);
   }
   const res = await opts.agent.com.atproto.repo.createRecord({
     repo: opts.did,
