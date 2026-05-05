@@ -7,6 +7,8 @@
  * normal `/sim` chat and with the `simocracy_chat` tool.
  */
 
+import { getSimocracySkillUrl } from "./simocracy.ts";
+
 export interface LoadedSim {
   uri: string;
   did: string;
@@ -55,6 +57,16 @@ export interface LoadedSim {
     /** Native PNG height in pixels. */
     heightPx: number;
   };
+  /** Fetched contents of `https://www.simocracy.org/skill.md` at
+   *  sim-load time, when the fetch succeeded. Appended verbatim to
+   *  the persona prompt by `buildSimPrompt`. Kept on the sim so a
+   *  re-render or a future `simocracy_chat` call uses the same
+   *  content the original load used. */
+  skillMd?: string;
+  /** Reason the skill.md fetch did not run / failed, when relevant.
+   *  Stored only for diagnostics — never injected into the persona
+   *  prompt. Surface optionally via `/sim status`. */
+  skillMdError?: string;
 }
 
 /**
@@ -85,6 +97,20 @@ export function buildSimPrompt(sim: LoadedSim): string {
     lines.push(``);
     lines.push(`## ${sim.name}'s speaking style`);
     lines.push(sim.style);
+  }
+  if (sim.skillMd) {
+    lines.push(``);
+    lines.push(`## Simocracy navigation cheat-sheet`);
+    lines.push(
+      `Your specific simocracy.org page: https://www.simocracy.org/sims/${sim.did}/${sim.rkey}` +
+        (sim.handle ? `\nThe owner's profile: https://www.simocracy.org/profile/${sim.handle}` : ""),
+    );
+    lines.push(``);
+    lines.push(
+      `The block below is fetched from ${getSimocracySkillUrl()} on every sim-load and is the canonical reference for URL patterns, indexer endpoints, and common navigation workflows. Treat it as authoritative; when the user asks about you, your gatherings, your proposals, or what other sims have been saying, follow this guide.`,
+    );
+    lines.push(``);
+    lines.push(sim.skillMd);
   }
   lines.push(``);
   lines.push(

@@ -345,3 +345,48 @@ export async function resolveHandle(did: string): Promise<string | null> {
 }
 
 export const SIMOCRACY_INDEXER_URL = DEFAULT_INDEXER_URL;
+
+const SIMOCRACY_SKILL_URL =
+  process.env.SIMOCRACY_SKILL_URL ?? "https://www.simocracy.org/skill.md";
+
+const SKILL_MD_FETCH_TIMEOUT_MS = 4000;
+const SKILL_MD_MAX_BYTES = 64 * 1024;
+
+/**
+ * Fetch the navigation cheat-sheet served at `simocracy.org/skill.md`.
+ * Never throws — returns either `{ text }` on success or `{ error }` on
+ * failure / disablement so the caller can record the diagnostic and
+ * fall through to the pre-change behaviour (no navigation guidance).
+ */
+export async function fetchSkillMd(): Promise<{ text?: string; error?: string }> {
+  if (process.env.SIMOCRACY_SKILL_MD_DISABLED === "1") {
+    return { error: "disabled by SIMOCRACY_SKILL_MD_DISABLED=1" };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SKILL_MD_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(SIMOCRACY_SKILL_URL, {
+      signal: controller.signal,
+      headers: { Accept: "text/markdown, text/plain;q=0.5" },
+    });
+    if (!res.ok) {
+      return { error: `${res.status} ${res.statusText}` };
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    const trimmed =
+      buf.byteLength > SKILL_MD_MAX_BYTES
+        ? buf.slice(0, SKILL_MD_MAX_BYTES).toString("utf8") +
+          `\n\n<!-- truncated at ${SKILL_MD_MAX_BYTES} bytes -->`
+        : buf.toString("utf8");
+    return { text: trimmed };
+  } catch (err) {
+    return { error: (err as Error).message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Exported for the persona prompt to mention the URL by name. */
+export function getSimocracySkillUrl(): string {
+  return SIMOCRACY_SKILL_URL;
+}

@@ -95,6 +95,7 @@ import {
   fetchAgentsForSim,
   fetchStyleForSim,
   fetchBlob,
+  fetchSkillMd,
   resolveHandle,
   parseAtUri,
   type AgentsRecord,
@@ -533,12 +534,14 @@ async function loadSimByName(query: string): Promise<{
 }
 
 async function hydrateLoadedSim(match: SimMatch): Promise<LoadedSim> {
-  // Fetch agents (constitution), style, sprite ANSI + handle in parallel.
-  const [agents, style, sprite, handle] = await Promise.all([
+  // Fetch agents (constitution), style, sprite ANSI, handle, and the
+  // simocracy.org navigation cheat-sheet in parallel.
+  const [agents, style, sprite, handle, skill] = await Promise.all([
     fetchAgentsForSim(match.uri).catch(() => null) as Promise<AgentsRecord | null>,
     fetchStyleForSim(match.uri).catch(() => null) as Promise<StyleRecord | null>,
     renderSprite(match).catch(() => null),
     resolveHandle(match.did).catch(() => null),
+    fetchSkillMd(),
   ]);
 
   return {
@@ -566,6 +569,8 @@ async function hydrateLoadedSim(match: SimMatch): Promise<LoadedSim> {
     shortDescription: agents?.shortDescription,
     description: agents?.description,
     style: style?.description,
+    skillMd: skill.text,
+    skillMdError: skill.text ? undefined : skill.error,
   };
 }
 

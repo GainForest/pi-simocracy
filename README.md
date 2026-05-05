@@ -69,6 +69,17 @@ Pi calls `simocracy_lookup_record` to find the AT-URI, then `simocracy_post_comm
 
 ---
 
+## Loaded-sim system prompt
+
+When a sim is loaded, pi injects the sim's identity, constitution, and speaking style into the system prompt every turn. On top of that, the persona prompt appends a **Simocracy navigation cheat-sheet** fetched live from [`simocracy.org/skill.md`](https://www.simocracy.org/skill.md) at sim-load time — that's where the URL patterns (`/sims/<did>/<rkey>`, `/profile/<handle>`, …), indexer endpoints, and recommended tool-routing live. simocracy.org is the single source of truth; this extension keeps no baked-in fallback. If the fetch fails (offline, simocracy.org down, route not yet deployed) the section is simply omitted — the sim still loads, it just lacks the navigation guidance until the URL becomes reachable.
+
+Override or disable:
+
+- `SIMOCRACY_SKILL_URL=…` — point at a staging URL (the route is also viewable in a browser).
+- `SIMOCRACY_SKILL_MD_DISABLED=1` — skip the fetch entirely (useful on metered connections / offline).
+
+---
+
 ## Sprite rendering
 
 Two formats supported:
