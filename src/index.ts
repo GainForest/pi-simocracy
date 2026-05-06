@@ -98,6 +98,7 @@ import {
   fetchSkillMd,
   resolveHandle,
   parseAtUri,
+  getRecordRefFromPds,
   type AgentsRecord,
   type SimMatch,
   type StyleRecord,
@@ -129,6 +130,7 @@ import {
   createComment,
   createCommentHistory,
   createProposal,
+  createProposalContext,
   createProposalHistory,
   createStyle,
   findRkeyForSim,
@@ -137,6 +139,7 @@ import {
   NotSimOwnerError,
   updateAgents,
   updateStyle,
+  type ProposalContextTarget,
 } from "./writes.ts";
 
 // ---------------------------------------------------------------------------
@@ -785,6 +788,25 @@ const PostProposalToolParams = Type.Object({
     Type.String({
       description:
         "https URL for the cover image. Defaults to the Simocracy banner if omitted. Image upload from disk is not supported — pass a URL or leave blank.",
+    }),
+  ),
+  // Parent-context binding — effectively required for the proposal to
+  // be discoverable on simocracy.org (post-Phase-5 the read paths only
+  // surface proposals that have a sidecar). Exactly one of the two must
+  // be passed; the execute handler enforces that.
+  gatheringUri: Type.Optional(
+    Type.String({
+      description:
+        "AT-URI of the parent gathering this proposal belongs to (an `org.simocracy.gathering` record). Pass exactly one of `gatheringUri` or `ftcSfFloor`. Get the URI by calling `simocracy_lookup_record` first — the LLM should resolve a fuzzy gathering name to a real AT-URI before submitting. Without a parent context, the proposal will be invisible on simocracy.org's `/proposals` feed.",
+      pattern: "^at://[^/]+/org\\.simocracy\\.gathering/[^/]+$",
+    }),
+  ),
+  ftcSfFloor: Type.Optional(
+    Type.Integer({
+      description:
+        "Frontier Tower SF floor number this proposal belongs to (1–14, with the static configuration in simocracy-v2's `lib/ftc-sf-data.ts`). Pass exactly one of `gatheringUri` or `ftcSfFloor`. Use this for proposals submitted to the Frontier Tower SF agentic funding experiment instead of a regular gathering.",
+      minimum: 1,
+      maximum: 14,
     }),
   ),
 });
@@ -1492,11 +1514,21 @@ export default async function simocracy(pi: ExtensionAPI) {
     name: "simocracy_post_proposal",
     label: "Submit a Simocracy proposal as the loaded sim",
     description:
-      "Submit a new funding proposal to Simocracy on behalf of the currently loaded sim. The sim should write the title + shortDescription + description in their own voice (their persona is already in your system prompt). Writes the proposal to the user's PDS plus an org.simocracy.history sidecar attributing the draft to the loaded sim. Use this when the user asks the sim to draft, propose, or submit a proposal — e.g. \"Mr Meow, propose a cat sanctuary\" or \"draft a proposal for solar panels\". Pass `budgetItems` if a budget request was discussed; pass `workScope` for tag-style categorization; pass `contributors` for credited humans. Image is optional and URL-only (the default Simocracy banner is used otherwise). Requires /sim login + a loaded sim the user owns.",
+      "Submit a new funding proposal to Simocracy on behalf of the currently loaded sim. The sim should write the title + shortDescription + description in their own voice (their persona is already in your system prompt). Writes THREE records to the user's PDS: (1) the proposal itself, (2) an `org.simocracy.proposalContext` sidecar binding the proposal to its parent gathering / FtC SF floor (required for the proposal to appear in simocracy.org's `/proposals` feed), and (3) an `org.simocracy.history` sidecar attributing the draft to the loaded sim. Use this when the user asks the sim to draft, propose, or submit a proposal — e.g. \"Mr Meow, propose a cat sanctuary\" or \"draft a proposal for solar panels\". You MUST pass exactly one of `gatheringUri` (to bind the proposal to a gathering) or `ftcSfFloor` (to bind to a Frontier Tower SF floor); call `simocracy_lookup_record` first to resolve a gathering name to its AT-URI. Pass `budgetItems` if a budget request was discussed; pass `workScope` for tag-style categorization; pass `contributors` for credited humans. Image is optional and URL-only (the default Simocracy banner is used otherwise). Requires /sim login + a loaded sim the user owns.",
     parameters: PostProposalToolParams,
     async execute(
       _id,
-      { title, shortDescription, description, workScope, contributors, budgetItems, imageUri },
+      {
+        title,
+        shortDescription,
+        description,
+        workScope,
+        contributors,
+        budgetItems,
+        imageUri,
+        gatheringUri,
+        ftcSfFloor,
+      },
     ) {
       if (!loadedSim) {
         throw new Error(
@@ -1518,6 +1550,64 @@ export default async function simocracy(pi: ExtensionAPI) {
       } catch (err) {
         if (err instanceof NotSignedInError) throw new Error(err.message);
         throw new Error(`ATProto auth failed: ${(err as Error).message}`);
+      }
+
+      // Parent-context validation — exactly one of gatheringUri / ftcSfFloor.
+      // Without one, the proposal is invisible on /proposals, so we require
+      // it up-front rather than letting the LLM ship orphaned proposals.
+      const hasGathering = gatheringUri !== undefined;
+      const hasFloor = ftcSfFloor !== undefined;
+      if (hasGathering && hasFloor) {
+        throw new Error(
+          "Pass exactly one of `gatheringUri` (for a gathering) or `ftcSfFloor` (for FtC SF), not both.",
+        );
+      }
+      if (!hasGathering && !hasFloor) {
+        throw new Error(
+          "A parent context is required: pass `gatheringUri` (an AT-URI to an `org.simocracy.gathering` — use `simocracy_lookup_record` to resolve a name) or `ftcSfFloor` (a Frontier Tower SF floor number 1–14). Without one, the proposal will be invisible on simocracy.org's /proposals feed.",
+        );
+      }
+
+      // Resolve gathering URI → StrongRef now (before any writes) so a
+      // typo or unreachable PDS surfaces *before* we put a half-orphaned
+      // proposal record into the user's repo.
+      let resolvedContext: ProposalContextTarget;
+      if (hasGathering) {
+        let gatheringDid: string;
+        let gatheringRkey: string;
+        try {
+          const parsed = parseAtUri(gatheringUri!);
+          if (parsed.collection !== "org.simocracy.gathering") {
+            throw new Error(
+              `gatheringUri must point at an org.simocracy.gathering record (got ${parsed.collection}).`,
+            );
+          }
+          gatheringDid = parsed.did;
+          gatheringRkey = parsed.rkey;
+        } catch (err) {
+          throw new Error(
+            `gatheringUri is not a valid AT-URI: ${(err as Error).message}`,
+          );
+        }
+        let gatheringRef: { uri: string; cid: string };
+        try {
+          gatheringRef = await getRecordRefFromPds(
+            gatheringDid,
+            "org.simocracy.gathering",
+            gatheringRkey,
+          );
+        } catch (err) {
+          throw new Error(
+            `Couldn't fetch gathering record from owner's PDS — verify the URI is correct and the gathering still exists. ${(err as Error).message}`,
+          );
+        }
+        resolvedContext = {
+          kind: "gathering",
+          uri: gatheringRef.uri,
+          cid: gatheringRef.cid,
+        };
+      } else {
+        resolvedContext = { kind: "ftc-sf", floorNumber: ftcSfFloor! };
       }
 
       // Resolve the cover image — either an LLM-supplied https URL or
@@ -1573,6 +1663,26 @@ export default async function simocracy(pi: ExtensionAPI) {
         throw new Error(`Proposal write failed: ${(err as Error).message}`);
       }
 
+      // Parent-context sidecar — written FIRST after the proposal so a
+      // visibility failure is loud and immediate. If this fails the
+      // proposal is already on the user's PDS but won't surface on
+      // /proposals; we surface a warning so the LLM can retry just this
+      // sidecar instead of re-submitting the whole proposal.
+      let contextSidecarUri: string | undefined;
+      let contextSidecarWarning: string | undefined;
+      try {
+        const ctxWrite = await createProposalContext({
+          agent: pdsAgent,
+          did: auth.did,
+          proposalUri: proposal.uri,
+          proposalCid: proposal.cid,
+          context: resolvedContext,
+        });
+        contextSidecarUri = ctxWrite.uri;
+      } catch (err) {
+        contextSidecarWarning = `Parent-context sidecar failed: ${(err as Error).message}`;
+      }
+
       let sidecarUri: string | undefined;
       let sidecarWarning: string | undefined;
       try {
@@ -1593,12 +1703,25 @@ export default async function simocracy(pi: ExtensionAPI) {
         sidecarWarning = `Sim-attribution sidecar failed: ${(err as Error).message}`;
       }
 
+      const parentLabel =
+        resolvedContext.kind === "gathering"
+          ? `gathering ${resolvedContext.uri}`
+          : `FtC SF floor ${resolvedContext.floorNumber}`;
       const lines = [
         `Submitted proposal as ${loadedSim.name}${loadedSim.handle ? ` (@${loadedSim.handle})` : ""}:`,
         `  title:        ${title}`,
         `  proposal URI: ${proposal.uri}`,
+        `  parent:       ${parentLabel}`,
         `  image:        ${imageRef.uri}`,
       ];
+      if (contextSidecarUri) {
+        lines.push(`  context:      ${contextSidecarUri}  (org.simocracy.proposalContext sidecar)`);
+      } else if (contextSidecarWarning) {
+        lines.push(`  WARNING:      ${contextSidecarWarning}`);
+        lines.push(
+          `                The proposal is posted but will be invisible on /proposals until a proposalContext sidecar is written.`,
+        );
+      }
       if (sidecarUri) {
         lines.push(`  attribution:  ${sidecarUri}  (org.simocracy.history sidecar)`);
       } else if (sidecarWarning) {
@@ -1621,6 +1744,12 @@ export default async function simocracy(pi: ExtensionAPI) {
           budgetItemCount: budgetItems?.length ?? 0,
           simUri: loadedSim.uri,
           simName: loadedSim.name,
+          parent:
+            resolvedContext.kind === "gathering"
+              ? { kind: "gathering", uri: resolvedContext.uri, cid: resolvedContext.cid }
+              : { kind: "ftc-sf", floorNumber: resolvedContext.floorNumber },
+          contextSidecarUri,
+          contextSidecarWarning,
           sidecarUri,
           sidecarWarning,
         },

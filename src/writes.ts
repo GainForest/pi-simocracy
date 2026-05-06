@@ -130,6 +130,7 @@ const COLLECTION_STYLE = "org.simocracy.style";
 const COLLECTION_COMMENT = "org.impactindexer.review.comment";
 const COLLECTION_HISTORY = "org.simocracy.history";
 const COLLECTION_PROPOSAL = "org.hypercerts.claim.activity";
+const COLLECTION_PROPOSAL_CONTEXT = "org.simocracy.proposalContext";
 
 /**
  * Defense-in-depth: every write helper below verifies the target
@@ -446,6 +447,86 @@ export async function createProposal(opts: {
   const res = await opts.agent.com.atproto.repo.createRecord({
     repo: opts.did,
     collection: COLLECTION_PROPOSAL,
+    record,
+  });
+  return {
+    uri: res.data.uri,
+    cid: res.data.cid,
+    rkey: res.data.uri.split("/").pop() ?? "",
+  };
+}
+
+/**
+ * Discriminated parent target for an `org.simocracy.proposalContext`
+ * sidecar. Mirrors the lexicon's `context` union (#gatheringContext
+ * vs #ftcSfContext); see `simocracy-v2/lexicons/org/simocracy/proposalContext.json`.
+ */
+export type ProposalContextTarget =
+  | { kind: "gathering"; uri: string; cid: string }
+  | { kind: "ftc-sf"; floorNumber: number };
+
+/**
+ * POST `org.simocracy.proposalContext` (parent-context sidecar).
+ *
+ * Binds a proposal to its parent container — either an
+ * `org.simocracy.gathering` record (via StrongRef) or a static FtC SF
+ * floor number. Without this sidecar, simocracy.org's read paths
+ * (post-Phase-5) won't surface the proposal on `/proposals` or under
+ * the gathering / floor it belongs to. The sidecar is therefore
+ * effectively required for any proposal submitted via this tool.
+ *
+ * Same trust model as `org.simocracy.history` — lives in the
+ * proposer's own PDS so the resolver's tier-1 (proposer-PDS) >
+ * tier-2 (facilitator-PDS) precedence rule lets a backfill record
+ * be silently superseded if the proposer ever re-saves.
+ *
+ * No sim-ownership precondition: a proposal isn't sim-owned, and
+ * the sidecar references the proposal + parent gathering, not the
+ * sim. The OAuth precondition ($DID matches signed-in DID and the
+ * agent is authenticated) is enforced upstream by
+ * `assertCanWriteToSim` at the tool entry point.
+ */
+export async function createProposalContext(opts: {
+  agent: Agent;
+  did: string;
+  proposalUri: string;
+  proposalCid: string;
+  context: ProposalContextTarget;
+}): Promise<{ uri: string; cid: string; rkey: string }> {
+  let context: Record<string, unknown>;
+  if (opts.context.kind === "gathering") {
+    if (!opts.context.uri || !opts.context.cid) {
+      throw new Error(
+        "Gathering parent context requires both uri and cid (a full StrongRef).",
+      );
+    }
+    context = {
+      $type: `${COLLECTION_PROPOSAL_CONTEXT}#gatheringContext`,
+      gathering: { uri: opts.context.uri, cid: opts.context.cid },
+    };
+  } else {
+    if (
+      !Number.isInteger(opts.context.floorNumber) ||
+      opts.context.floorNumber < 1
+    ) {
+      throw new Error(
+        `FtC SF floor number must be a positive integer (got ${opts.context.floorNumber}).`,
+      );
+    }
+    context = {
+      $type: `${COLLECTION_PROPOSAL_CONTEXT}#ftcSfContext`,
+      floorNumber: opts.context.floorNumber,
+    };
+  }
+  const record = {
+    $type: COLLECTION_PROPOSAL_CONTEXT,
+    subject: { uri: opts.proposalUri, cid: opts.proposalCid },
+    context,
+    createdAt: new Date().toISOString(),
+  };
+  const res = await opts.agent.com.atproto.repo.createRecord({
+    repo: opts.did,
+    collection: COLLECTION_PROPOSAL_CONTEXT,
     record,
   });
   return {

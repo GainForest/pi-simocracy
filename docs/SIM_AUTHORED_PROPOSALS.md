@@ -12,7 +12,7 @@ subject collection.
 ## TL;DR
 
 When pi submits a proposal on behalf of a loaded sim, it writes
-**two** records to the user's PDS:
+**three** records to the user's PDS:
 
 1. **`org.hypercerts.claim.activity`** — the proposal itself, in the
    exact shape simocracy.org's `ProposalFormDialog` already writes
@@ -20,16 +20,27 @@ When pi submits a proposal on behalf of a loaded sim, it writes
    `workScope` / `contributors` / `image`, `createdAt`). Old readers
    (Hyperindexer, the existing webapp) see this as a regular
    user-authored proposal — graceful degradation.
-2. **`org.simocracy.history`** — sidecar record with `type:
+2. **`org.simocracy.proposalContext`** — sidecar binding the proposal
+   to its parent gathering (StrongRef to `org.simocracy.gathering`)
+   or to a Frontier Tower SF floor (`floorNumber` integer). Required
+   for visibility: post-Phase-5, simocracy.org's `/proposals` feed
+   sources its seed set from `org.simocracy.proposalContext` records,
+   not from a hashtag scan, so a proposal without this sidecar is
+   invisible. Lives in the proposer's PDS so the resolver's tier-1
+   (proposer) > tier-2 (facilitator backfill) precedence works.
+3. **`org.simocracy.history`** — sidecar record with `type:
    "proposal"`, `subjectUri` pointing at the proposal we just wrote,
    `simUris[]` / `simNames[]` declaring which sim spoke. New `type`
    value, but the lexicon's `type` field is free-form string and the
    indexer already accepts new event types as they appear.
 
-Renderers that understand the join (simocracy.org, when the planned
-change lands) will display a sim badge on the proposal card;
+Renderers that understand the history join (simocracy.org, since
+the planned change landed) display a sim badge on the proposal card;
 renderers that don't keep showing it as a regular user proposal.
-**Zero hypercerts lexicon changes. Zero new Simocracy lexicons.**
+**Zero hypercerts lexicon changes.** One new Simocracy lexicon was
+added for proposalContext (see `simocracy-v2/lexicons/org/simocracy/proposalContext.json`)
+so every Simocracy-bound proposal carries a typed back-pointer to
+its parent.
 
 ---
 
@@ -67,6 +78,17 @@ Use it as-is.
 Implemented by `simocracy_post_proposal` in `src/index.ts`:
 
 ```ts
+// Tool input — exactly one of gatheringUri / ftcSfFloor must be set.
+// gatheringUri is fetched ahead of any writes so a typo or unreachable
+// PDS surfaces *before* an orphaned proposal lands in the user's repo.
+const gatheringRef =
+  gatheringUri
+    ? await getRecordRefFromPds(parsed.did, "org.simocracy.gathering", parsed.rkey)
+    : undefined;
+const resolvedContext = gatheringRef
+  ? { kind: "gathering" as const, uri: gatheringRef.uri, cid: gatheringRef.cid }
+  : { kind: "ftc-sf" as const, floorNumber: ftcSfFloor };
+
 // 1. The proposal — same shape as ProposalFormDialog writes today.
 const proposal = await createProposal({
   agent, did,
@@ -78,7 +100,17 @@ const proposal = await createProposal({
   image: { $type: "org.hypercerts.defs#uri", uri: imageUri ?? DEFAULT_BANNER },
 });
 
-// 2. The sim-attribution sidecar — required, since attribution is the whole
+// 2. The parent-context sidecar — required for visibility on /proposals.
+//    A failure here doesn't roll back the proposal but is surfaced as
+//    a `contextSidecarWarning` so the LLM can retry just the sidecar.
+await createProposalContext({
+  agent, did,
+  proposalUri: proposal.uri,
+  proposalCid: proposal.cid,
+  context: resolvedContext,
+});
+
+// 3. The sim-attribution sidecar — required, since attribution is the whole
 //    point of this tool.
 await createProposalHistory({
   agent, did,
@@ -190,9 +222,12 @@ chat / hearing / sprocess events — no new indexer queries needed.
 ## Status
 
 - ✅ Implemented in pi-simocracy `simocracy_post_proposal` (this repo)
-- 🟡 Renderer changes pending in simocracy-v2
-- 🟢 Lexicons unchanged — both repos can ship the change independently
+- ✅ Renderer changes shipped in simocracy-v2
+- ✅ `org.simocracy.proposalContext` lexicon shipped (1 new Simocracy lexicon, 0 hypercerts changes)
 
-The proposal + history pair is being written today. As soon as
-simocracy-v2 lands the renderer change, every existing pi-authored
-sim proposal retro-actively gets the sim badge — no migration.
+The proposal + proposalContext + history triple is being written
+today. Every pi-authored proposal carries both the sim badge
+(history sidecar) and the parent-gathering binding
+(proposalContext sidecar), so it surfaces correctly on
+`simocracy.org/proposals` and under its parent gathering page — no
+migration, no backfill needed for new submissions.

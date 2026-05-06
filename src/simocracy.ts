@@ -252,6 +252,34 @@ export async function getRecordFromPds<T>(did: string, collection: string, rkey:
   return json.value as T;
 }
 
+/**
+ * Read a record's StrongRef ({uri, cid}) directly from the owner's PDS.
+ *
+ * Same wire call as `getRecordFromPds` but returns the metadata needed to
+ * reference the record from another record (e.g. an `org.simocracy.proposalContext`
+ * sidecar's `subject` or `context.gathering` field). The body is intentionally
+ * dropped — callers that need it should use `getRecordFromPds` instead.
+ */
+export async function getRecordRefFromPds(
+  did: string,
+  collection: string,
+  rkey: string,
+): Promise<{ uri: string; cid: string }> {
+  const pds = await resolvePds(did);
+  const url =
+    `${pds.replace(/\/+$/, "")}/xrpc/com.atproto.repo.getRecord` +
+    `?repo=${encodeURIComponent(did)}` +
+    `&collection=${encodeURIComponent(collection)}` +
+    `&rkey=${encodeURIComponent(rkey)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`PDS getRecord failed: ${res.status}`);
+  const json = (await res.json()) as { uri?: string; cid?: string };
+  if (!json.uri || !json.cid) {
+    throw new Error(`PDS getRecord returned no uri/cid: ${url}`);
+  }
+  return { uri: json.uri, cid: json.cid };
+}
+
 /** List records by paging com.atproto.repo.listRecords on a PDS. */
 export async function listRecordsFromPds<T>(did: string, collection: string): Promise<Array<{ uri: string; cid: string; value: T }>> {
   const pds = await resolvePds(did);
