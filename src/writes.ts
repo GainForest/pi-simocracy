@@ -131,6 +131,7 @@ const COLLECTION_COMMENT = "org.impactindexer.review.comment";
 const COLLECTION_HISTORY = "org.simocracy.history";
 const COLLECTION_PROPOSAL = "org.hypercerts.claim.activity";
 const COLLECTION_PROPOSAL_CONTEXT = "org.simocracy.proposalContext";
+const COLLECTION_SKILL = "org.simocracy.skill";
 
 /**
  * Defense-in-depth: every write helper below verifies the target
@@ -581,6 +582,117 @@ export async function createProposalHistory(opts: {
   if (opts.content) {
     const trimmed = opts.content.trim();
     if (trimmed) record.content = trimmed.slice(0, 5000);
+  }
+  const res = await opts.agent.com.atproto.repo.createRecord({
+    repo: opts.did,
+    collection: COLLECTION_HISTORY,
+    record,
+  });
+  return {
+    uri: res.data.uri,
+    cid: res.data.cid,
+    rkey: res.data.uri.split("/").pop() ?? "",
+  };
+}
+
+/**
+ * POST `org.simocracy.skill` (an Anthropic-style agent skill).
+ *
+ * The lexicon stores the SKILL.md frontmatter (`name`, `description`)
+ * as separate fields and the markdown body in `body`, so the indexer
+ * can filter on metadata cheaply without parsing markdown. The full
+ * SKILL.md is reconstructed at serve time by simocracy.org's
+ * `/skills/[did]/[rkey]/skill.md` route.
+ *
+ * Skills are NOT 1:1 with sims — the lexicon has no `sim` ref. They
+ * live in the *user's* own PDS exactly the way simocracy.org's
+ * `SkillFormDialog` writes them today, so a sim-authored skill
+ * renders identically to a human-authored skill on the gallery.
+ * Sim attribution is a sidecar `org.simocracy.history` record
+ * written by `createSkillHistory` below — same pattern as comments
+ * and proposals. See `docs/SIM_AUTHORED_SKILLS.md` for the design.
+ */
+export async function createSkill(opts: {
+  agent: Agent;
+  did: string;
+  name: string;
+  description: string;
+  body: string;
+}): Promise<{ uri: string; cid: string; rkey: string }> {
+  const name = opts.name.trim();
+  if (!name) throw new Error("Skill name is required.");
+  const description = opts.description.trim();
+  if (!description) throw new Error("Skill description is required.");
+  const body = opts.body.trim();
+  if (!body) throw new Error("Skill body is required.");
+  // Lexicon caps (mirrored from lexicons/org/simocracy/skill.json):
+  //   name        ≤ 100 graphemes (maxLength 1000)
+  //   description ≤ 1024 graphemes (maxLength 10000)
+  //   body        ≤ 50000 graphemes (maxLength 500000)
+  // Slice on JS string length is a conservative approximation of grapheme
+  // count — it never exceeds the limit, occasionally trims early on rare
+  // multi-codepoint clusters. Same approach used elsewhere in this module.
+  const record = {
+    $type: COLLECTION_SKILL,
+    name: name.slice(0, 1000),
+    description: description.slice(0, 10000),
+    body: body.slice(0, 500000),
+    createdAt: new Date().toISOString(),
+  };
+  const res = await opts.agent.com.atproto.repo.createRecord({
+    repo: opts.did,
+    collection: COLLECTION_SKILL,
+    record,
+  });
+  return {
+    uri: res.data.uri,
+    cid: res.data.cid,
+    rkey: res.data.uri.split("/").pop() ?? "",
+  };
+}
+
+/**
+ * Sim-attribution sidecar for a skill.
+ *
+ * Mirrors `createCommentHistory` and `createProposalHistory` exactly —
+ * same `org.simocracy.history` lexicon, same join-key shape, just
+ * `type: "skill"` and `subjectCollection: "org.simocracy.skill"`.
+ * The lexicon's `type` field is free-form string and the indexer
+ * already accepts new event types as they appear (history.json
+ * documents this explicitly).
+ *
+ * Writes to the *user's* own PDS — the attribution is an event the
+ * user triggered and naturally belongs in their history.
+ */
+export async function createSkillHistory(opts: {
+  agent: Agent;
+  did: string;
+  skillUri: string;
+  skillName: string;
+  skillDescription: string;
+  simUri: string;
+  simName: string;
+}): Promise<{ uri: string; cid: string; rkey: string }> {
+  // Defense-in-depth: the sim must live in the same repo we're writing
+  // to. The skill record itself isn't sim-owned, but the history
+  // sidecar *claims attribution to* a sim — only the sim's owner can
+  // make that claim.
+  assertRepoOwnsSimUri(opts.did, opts.simUri);
+  const skillName = opts.skillName.trim();
+  const description = opts.skillDescription.trim();
+  const record: Record<string, unknown> = {
+    $type: COLLECTION_HISTORY,
+    type: "skill",
+    actorDid: opts.did,
+    simNames: [opts.simName].slice(0, 10),
+    simUris: [opts.simUri].slice(0, 10),
+    subjectUri: opts.skillUri,
+    subjectCollection: COLLECTION_SKILL,
+    subjectName: skillName.slice(0, 500),
+    createdAt: new Date().toISOString(),
+  };
+  if (description) {
+    record.content = description.slice(0, 5000);
   }
   const res = await opts.agent.com.atproto.repo.createRecord({
     repo: opts.did,

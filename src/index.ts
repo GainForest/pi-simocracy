@@ -61,6 +61,14 @@
  *                             `type: "proposal"`. Same write pattern
  *                             as `simocracy_post_comment`. Requires
  *                             /sim login + sim ownership.
+ *  - `simocracy_post_skill`   Publish an Anthropic-style agent skill
+ *                             (`org.simocracy.skill`) on behalf of
+ *                             the loaded sim, plus an
+ *                             `org.simocracy.history` sidecar with
+ *                             `type: "skill"`. Same write pattern as
+ *                             `simocracy_post_comment` /
+ *                             `simocracy_post_proposal`. Requires
+ *                             /sim login + sim ownership.
  *  - `simocracy_lookup_record` Look up a sim / proposal / gathering /
  *                             decision / comment by AT-URI or fuzzy
  *                             name and return its details + comment
@@ -132,6 +140,8 @@ import {
   createProposal,
   createProposalContext,
   createProposalHistory,
+  createSkill,
+  createSkillHistory,
   createStyle,
   findRkeyForSim,
   getAuthenticatedAgent,
@@ -809,6 +819,28 @@ const PostProposalToolParams = Type.Object({
       maximum: 14,
     }),
   ),
+});
+
+const PostSkillToolParams = Type.Object({
+  name: Type.String({
+    description:
+      "Skill identifier — lowercase, kebab-case (e.g. `quadratic-funding`). Maps to the `name` field of the SKILL.md YAML frontmatter. Required, max 100 characters.",
+    minLength: 1,
+    maxLength: 100,
+    pattern: "^[a-z][a-z0-9-]*$",
+  }),
+  description: Type.String({
+    description:
+      "Skill triggering description — what the skill does AND when an agent should load it. Maps to the `description` field of the SKILL.md YAML frontmatter; this is the primary signal an agent uses to decide whether to load the skill, so make it specific and a little pushy. Required, max 1024 characters.",
+    minLength: 1,
+    maxLength: 1024,
+  }),
+  body: Type.String({
+    description:
+      "Markdown body of SKILL.md, without YAML frontmatter — the actual instructions. Anthropic recommends keeping this under ~500 lines. Required, max 50000 characters.",
+    minLength: 1,
+    maxLength: 500000,
+  }),
 });
 
 const LookupRecordToolParams = Type.Object({
@@ -1750,6 +1782,131 @@ export default async function simocracy(pi: ExtensionAPI) {
               : { kind: "ftc-sf", floorNumber: resolvedContext.floorNumber },
           contextSidecarUri,
           contextSidecarWarning,
+          sidecarUri,
+          sidecarWarning,
+        },
+      };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Tool: simocracy_post_skill
+  //
+  // Publish an Anthropic-style agent skill (`org.simocracy.skill`) on
+  // behalf of the loaded sim. Two records are written to the user's
+  // PDS, mirroring `simocracy_post_comment` / `simocracy_post_proposal`:
+  //
+  //   1. org.simocracy.skill      the skill record itself, in the same
+  //      wire shape simocracy.org's `SkillFormDialog` writes today, so
+  //      it renders identically on /skills.
+  //   2. org.simocracy.history    sidecar with type="skill",
+  //      simUris=[loadedSim], subjectUri=<skill uri>. Renderers that
+  //      understand the join show the sim badge; others see a regular
+  //      user-authored skill — graceful degradation, zero lexicon
+  //      changes.
+  //
+  // See `docs/SIM_AUTHORED_SKILLS.md` for the design rationale.
+  // -------------------------------------------------------------------------
+  pi.registerTool({
+    name: "simocracy_post_skill",
+    label: "Publish a Simocracy skill as the loaded sim",
+    description:
+      "Publish an Anthropic-style agent skill (`org.simocracy.skill`) on behalf of the currently loaded sim. The sim should write the `name` (lowercase kebab-case identifier), `description` (what the skill does AND when an agent should load it — the primary trigger signal), and `body` (the markdown instructions, without YAML frontmatter) in their own voice; their persona is already in your system prompt. Writes TWO records to the user's PDS: (1) the `org.simocracy.skill` record itself in the same shape simocracy.org's SkillFormDialog writes today, and (2) an `org.simocracy.history` sidecar with `type: \"skill\"` attributing the skill to the loaded sim. Use this when the user asks the sim to write, publish, or share a skill — e.g. \"Mr Meow, draft a skill for evaluating cat-sanctuary proposals\" or \"publish a skill on quadratic funding\". The skill appears on simocracy.org/skills and can be loaded into any agent harness via /skills/<did>/<rkey>/skill.md. Anthropic recommends keeping `body` under ~500 lines. Requires /sim login + a loaded sim the user owns.",
+    parameters: PostSkillToolParams,
+    async execute(_id, { name, description, body }) {
+      if (!loadedSim) {
+        throw new Error(
+          "No sim loaded. Call simocracy_load_sim first — skills are published on behalf of a specific sim.",
+        );
+      }
+      let auth;
+      try {
+        auth = await assertCanWriteToSim(loadedSim, {
+          action: "publish a skill as",
+        });
+      } catch (err) {
+        if (err instanceof NotSignedInError || err instanceof NotSimOwnerError) {
+          throw new Error(err.message);
+        }
+        throw err;
+      }
+      let pdsAgent;
+      try {
+        ({ agent: pdsAgent } = await getAuthenticatedAgent());
+      } catch (err) {
+        if (err instanceof NotSignedInError) throw new Error(err.message);
+        throw new Error(`ATProto auth failed: ${(err as Error).message}`);
+      }
+
+      let skill;
+      try {
+        skill = await createSkill({
+          agent: pdsAgent,
+          did: auth.did,
+          name,
+          description,
+          body,
+        });
+      } catch (err) {
+        throw new Error(`Skill write failed: ${(err as Error).message}`);
+      }
+
+      let sidecarUri: string | undefined;
+      let sidecarWarning: string | undefined;
+      try {
+        const history = await createSkillHistory({
+          agent: pdsAgent,
+          did: auth.did,
+          skillUri: skill.uri,
+          skillName: name,
+          skillDescription: description,
+          simUri: loadedSim.uri,
+          simName: loadedSim.name,
+        });
+        sidecarUri = history.uri;
+      } catch (err) {
+        // Don't roll back — the skill is already on the user's PDS.
+        // The sidecar can be re-written later. Surface the warning so
+        // the LLM can decide whether to retry.
+        sidecarWarning = `Sim-attribution sidecar failed: ${(err as Error).message}`;
+      }
+
+      // Public URLs the LLM can hand back to the user. The skill page
+      // is served by simocracy-v2's /skills/[did]/[rkey] route; the
+      // .md endpoint reconstructs the full SKILL.md (frontmatter + body)
+      // for any agent harness that wants to load it.
+      const did = encodeURIComponent(loadedSim.did);
+      const rkey = encodeURIComponent(skill.rkey);
+      const pageUrl = `https://www.simocracy.org/skills/${did}/${rkey}`;
+      const skillMdUrl = `https://www.simocracy.org/skills/${did}/${rkey}/skill.md`;
+
+      const lines = [
+        `Published skill as ${loadedSim.name}${loadedSim.handle ? ` (@${loadedSim.handle})` : ""}:`,
+        `  name:        ${name}`,
+        `  skill URI:   ${skill.uri}`,
+        `  page:        ${pageUrl}`,
+        `  SKILL.md:    ${skillMdUrl}`,
+      ];
+      if (sidecarUri) {
+        lines.push(`  attribution: ${sidecarUri}  (org.simocracy.history sidecar)`);
+      } else if (sidecarWarning) {
+        lines.push(`  WARNING:     ${sidecarWarning}`);
+        lines.push(
+          `               The skill is published but will appear unattributed until a history sidecar is written.`,
+        );
+      }
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: {
+          skillUri: skill.uri,
+          skillRkey: skill.rkey,
+          skillCid: skill.cid,
+          name,
+          description,
+          pageUrl,
+          skillMdUrl,
+          simUri: loadedSim.uri,
+          simName: loadedSim.name,
           sidecarUri,
           sidecarWarning,
         },
