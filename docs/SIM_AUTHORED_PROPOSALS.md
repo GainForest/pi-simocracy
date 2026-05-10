@@ -18,8 +18,10 @@ When pi submits a proposal on behalf of a loaded sim, it writes
    exact shape simocracy.org's `ProposalFormDialog` already writes
    today (`title`, `shortDescription`, optional `description` /
    `workScope` / `contributors` / `image`, `createdAt`). Old readers
-   (Hyperindexer, the existing webapp) see this as a regular
-   user-authored proposal — graceful degradation.
+   that don't know about the history sidecar (Bluesky AppView,
+   third-party hypercerts consumers, the upstream Hyperindex network at
+   `api.hi.gainforest.app`) see this as a regular user-authored
+   proposal — graceful degradation.
 2. **`org.simocracy.proposalContext`** — sidecar binding the proposal
    to its parent gathering (StrongRef to `org.simocracy.gathering`)
    or to a Frontier Tower SF floor (`floorNumber` integer). Required
@@ -46,11 +48,12 @@ its parent.
 
 ## Why no lexicon change
 
-The `org.hypercerts.*` namespace is owned by the GainForest
-hyperindexer project, not Simocracy — extending
-`org.hypercerts.claim.activity` with a `sim` StrongRef field would
-couple two independent release cycles together for one cross-app
-feature, and the same argument made for comments
+The `org.hypercerts.*` namespace is owned by the
+[`hypercerts-org/hypercerts-lexicon`](https://github.com/hypercerts-org/hypercerts-lexicon)
+project, not Simocracy — extending `org.hypercerts.claim.activity`
+with a `sim` StrongRef field would couple two independent release
+cycles together for one cross-app feature, and the same argument
+made for comments
 ([`SIM_AUTHORED_COMMENTS.md`](./SIM_AUTHORED_COMMENTS.md)) applies
 verbatim here.
 

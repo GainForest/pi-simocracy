@@ -5,11 +5,18 @@
  * (`lookupRecord`) handles every kind the LLM might want to inspect:
  * sims, proposals, gatherings, decisions, and individual comments.
  *
- * Two indexers are queried (Simocracy + Hyperindexer) plus the
+ * Reads go through one indexer (`simocracy-indexer`) plus the
  * owner's PDS for direct AT-URI lookups. Sim-attribution for
  * comments is joined client-side from `org.simocracy.history`
  * records — same pattern simocracy-v2's notifications system uses.
  * See `docs/SIM_AUTHORED_COMMENTS.md` for the full design.
+ *
+ * Pre-2026-05-10 this fanned out across two indexers (Simocracy +
+ * Hyperindex). The single-indexer migration
+ * (https://pi-eval.vercel.app/reports/simocracy-indexer/drop-hyperindex-migration/)
+ * folded `org.hypercerts.*` / `org.impactindexer.*` / `app.certified.*`
+ * into the same Simocracy indexer, so this file collapsed to a single
+ * URL.
  */
 
 import {
@@ -20,9 +27,6 @@ import {
   searchSimsByName,
   SIMOCRACY_INDEXER_URL,
 } from "./simocracy.ts";
-
-/** Hyperindexer base URL — handles `org.hypercerts.*` and `org.impactindexer.*`. */
-const HYPERINDEXER_URL = "https://api.hi.gainforest.app";
 
 const COLLECTION_SIM = "org.simocracy.sim";
 const COLLECTION_PROPOSAL = "org.hypercerts.claim.activity";
@@ -55,10 +59,16 @@ const KIND_BY_COLLECTION: Record<string, Exclude<LookupKind, "auto">> = {
   [COLLECTION_COMMENT]: "comment",
 };
 
-/** Which indexer hosts which collection. */
-function indexerForCollection(collection: string): string {
-  if (collection.startsWith("org.simocracy.")) return SIMOCRACY_INDEXER_URL;
-  return HYPERINDEXER_URL;
+/**
+ * Which indexer hosts which collection.
+ *
+ * Trivial post-migration — every collection we read lives on the
+ * same indexer. Kept as a helper so the call sites read clearly
+ * and so a future split (if one ever shows up) only needs to edit
+ * one place.
+ */
+function indexerForCollection(_collection: string): string {
+  return SIMOCRACY_INDEXER_URL;
 }
 
 interface GraphQLNode {
@@ -82,6 +92,8 @@ async function fetchRecordsFromIndexer(
   collection: string,
   first: number,
 ): Promise<GraphQLNode[]> {
+  // indexerForCollection returns the same URL for everything
+  // post-2026-05-10; the helper survives in case a future split needs it.
   const url = `${indexerForCollection(collection).replace(/\/+$/, "")}/graphql`;
   const res = await fetch(url, {
     method: "POST",

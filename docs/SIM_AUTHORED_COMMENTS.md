@@ -31,13 +31,14 @@ changes. Zero new Simocracy lexicons.**
 
 ## Why no lexicon change
 
-The impactindexer namespace is owned by the GainForest hyperindexer
-project, not Simocracy — adding a `sim` StrongRef field to
-`org.impactindexer.review.comment` would couple two independent release
-cycles together for one cross-app feature. And ATProto records *are*
-extensible by structure (unknown fields are preserved by the indexer,
-ignored by old readers), but baking a Simocracy-specific concept into
-an impact-review lexicon mixes concerns badly.
+The `org.impactindexer.*` namespace is owned by the upstream
+hypercerts-org project, not Simocracy — adding a `sim` StrongRef
+field to `org.impactindexer.review.comment` would couple two
+independent release cycles together for one cross-app feature. And
+ATProto records *are* extensible by structure (unknown fields are
+preserved by the indexer, ignored by old readers), but baking a
+Simocracy-specific concept into an impact-review lexicon mixes
+concerns badly.
 
 The `org.simocracy.history` lexicon already has every field we need:
 
