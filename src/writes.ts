@@ -433,16 +433,36 @@ export async function createProposal(opts: {
     shortDescription: shortDescription.slice(0, 300),
     createdAt: new Date().toISOString(),
   };
+  // `description` and `workScope` are UNION types in the
+  // org.hypercerts.claim.activity lexicon — they MUST be wrapped objects
+  // with a `$type` discriminator. Plain strings are rejected by lex-gql
+  // (silently drops the record from the indexer). Same applies to each
+  // `contributorIdentity` (also a union).
   if (opts.description !== undefined) {
     const body = opts.description.trim();
-    if (body) record.description = body;
+    if (body) {
+      record.description = {
+        $type: "org.hypercerts.defs#descriptionString",
+        value: body,
+      };
+    }
   }
   if (opts.workScope !== undefined) {
     const ws = opts.workScope.trim();
-    if (ws) record.workScope = ws;
+    if (ws) {
+      record.workScope = {
+        $type: "org.hypercerts.claim.activity#workScopeString",
+        scope: ws,
+      };
+    }
   }
   if (opts.contributors && opts.contributors.length > 0) {
-    record.contributors = opts.contributors;
+    record.contributors = opts.contributors.map((c) => ({
+      contributorIdentity: {
+        $type: "org.hypercerts.claim.activity#contributorIdentity",
+        identity: c.contributorIdentity,
+      },
+    }));
   }
   if (opts.image) record.image = opts.image;
   const res = await opts.agent.com.atproto.repo.createRecord({
